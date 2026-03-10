@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import dataclasses
+import hashlib
 import io
 import json
 import logging
@@ -15,6 +16,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 import httpx
+import redis.asyncio as aioredis
 
 # ---------------------------------------------------------------------------
 # UTF-8 JSON Response
@@ -37,6 +39,7 @@ log = logging.getLogger("wrapper")
 
 GOSOM_API_URL = os.environ.get("GOSOM_API_URL", "http://localhost:8080/api/v1")
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", "gmapsdata/json")).resolve()
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 MAX_POLLS = 720          # ~36 dk (ortalama 3sn aralıkla)
 
 # job_id doğrulama: kesin UUID formatı
@@ -46,6 +49,9 @@ _VALID_JOB_ID = re.compile(
 
 # Klasör adı doğrulama: YYYY-MM-DD formatı
 _DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Redis TTL: 48 saat
+_REDIS_TTL = 172800
 
 # ---------------------------------------------------------------------------
 # Value / CSV helpers  (mevcut – değişiklik yok)
@@ -80,8 +86,11 @@ def _parse_csv(text: str) -> list[dict]:
 # Cache key
 # ---------------------------------------------------------------------------
 
-def _cache_key(query: str, depth: int, max_reviews: int) -> tuple:
-    return (query.strip().lower(), depth, max_reviews, date.today().isoformat())
+def _cache_key_hash(query: str, depth: int, max_reviews: int) -> str:
+    """Dedup için deterministic hash."""
+    today = date.today().isoformat()
+    raw = f"{query.strip().lower()}:{depth}:{max_reviews}:{today}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 # ---------------------------------------------------------------------------
 # JobRecord
@@ -107,13 +116,11 @@ class JobRecord:
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 # ---------------------------------------------------------------------------
-# Module-level state
+# Module-level state — Redis replaces in-memory dicts
 # ---------------------------------------------------------------------------
 
-_jobs: dict[str, JobRecord] = {}          # job_id → JobRecord
-_query_index: dict[tuple, str] = {}       # cache_key → job_id
-_active_tasks: set[asyncio.Task] = set()  # background poll task'ları
-_creating_keys: set[tuple] = set()        # race condition koruması
+_redis: aioredis.Redis | None = None
+_active_tasks: set[asyncio.Task] = set()  # per-pod background poll task'ları
 
 # ---------------------------------------------------------------------------
 # Path helpers — job'un kendi tarihini kullanır
@@ -161,7 +168,38 @@ def _result_path_for_read(job_id: str, job_date: str) -> Path:
     return p
 
 # ---------------------------------------------------------------------------
-# Disk persistence helpers
+# Redis helpers
+# ---------------------------------------------------------------------------
+
+async def _save_job_to_redis(rec: JobRecord, retries: int = 3):
+    """JobRecord'u Redis'e kaydet. Terminal state'lerde retry ile güvenli."""
+    for attempt in range(1, retries + 1):
+        try:
+            pipe = _redis.pipeline()
+            pipe.set(f"job:{rec.job_id}", json.dumps(rec.to_dict(), ensure_ascii=False), ex=_REDIS_TTL)
+            pipe.sadd(f"jobs:date:{rec.date}", rec.job_id)
+            pipe.expire(f"jobs:date:{rec.date}", _REDIS_TTL)
+            await pipe.execute()
+            return
+        except Exception as e:
+            if attempt == retries:
+                raise
+            log.warning(f"[{rec.job_id[:8]}] Redis kayıt denemesi {attempt}/{retries} başarısız: {e}")
+            await asyncio.sleep(0.5 * attempt)
+
+
+async def _get_job_from_redis(job_id: str) -> JobRecord | None:
+    """Redis'ten JobRecord oku."""
+    data = await _redis.get(f"job:{job_id}")
+    if not data:
+        return None
+    try:
+        return JobRecord.from_dict(json.loads(data))
+    except (json.JSONDecodeError, TypeError, KeyError):
+        return None
+
+# ---------------------------------------------------------------------------
+# Disk persistence helpers (backup — Redis primary source of truth)
 # ---------------------------------------------------------------------------
 
 def _write_index_records(job_date: str, records: list[dict]) -> None:
@@ -181,16 +219,60 @@ def _write_index_records(job_date: str, records: list[dict]) -> None:
 
 
 async def _save_index(job_date: str | None = None):
-    """Belirtilen günün index.json'ını asyncio thread'inde yaz.
-    Snapshot event-loop thread'inde alınır, yazma ayrı thread'de yapılır."""
+    """Belirtilen günün index.json'ını disk backup olarak yaz.
+    Redis'ten o günün job'larını alıp diske yazar."""
     target_date = job_date or date.today().isoformat()
-    records = [r.to_dict() for r in _jobs.values() if r.date == target_date]
-    await asyncio.to_thread(_write_index_records, target_date, records)
+    try:
+        job_ids = await _redis.smembers(f"jobs:date:{target_date}")
+        if not job_ids:
+            return
+        records = []
+        for jid in job_ids:
+            rec = await _get_job_from_redis(jid)
+            if rec:
+                records.append(rec.to_dict())
+        await asyncio.to_thread(_write_index_records, target_date, records)
+    except Exception as e:
+        log.warning(f"Index disk backup yazılamadı ({target_date}): {e}")
 
 
-def _load_todays_index():
-    """Startup'ta bugünün index.json'ını oku, _jobs ve _query_index'i doldur."""
+async def _load_todays_index():
+    """Startup'ta Redis'ten bugünün job'larını yükle. Fallback: disk."""
     today = date.today().isoformat()
+
+    # Redis'ten yükle
+    try:
+        job_ids = await _redis.smembers(f"jobs:date:{today}")
+        if job_ids:
+            count = 0
+            for jid in job_ids:
+                rec = await _get_job_from_redis(jid)
+                if not rec:
+                    continue
+                count += 1
+                if rec.status == "pending":
+                    # Disk'te sonuç dosyası varsa Redis'i güncelle, tekrar poll'a gerek yok
+                    try:
+                        result_file = _result_path_for_read(rec.job_id, rec.date)
+                        if result_file.exists():
+                            data = json.loads(result_file.read_text(encoding="utf-8"))
+                            rec.status = "ok"
+                            rec.result_count = len(data)
+                            await _save_job_to_redis(rec)
+                            log.info(f"[{rec.job_id[:8]}] Disk'ten recover edildi ({rec.result_count} kayıt)")
+                            continue
+                    except Exception:
+                        pass  # Dosya okunamadı, normal polling'e devam
+                    log.info(f"Pending job için polling yeniden başlatılıyor: {rec.job_id[:8]}")
+                    task = asyncio.create_task(_poll_and_finalize(rec))
+                    _active_tasks.add(task)
+                    task.add_done_callback(_active_tasks.discard)
+            log.info(f"Redis'ten {count} job yüklendi (bugün)")
+            return
+    except Exception as e:
+        log.warning(f"Redis'ten yükleme başarısız, disk fallback: {e}")
+
+    # Fallback: disk'ten yükle ve Redis'e aktar
     path = _dir_for_date(today) / "index.json"
     if not path.exists():
         return
@@ -205,10 +287,19 @@ def _load_todays_index():
         except (TypeError, KeyError) as e:
             log.warning(f"index.json kaydı atlandı (şema uyumsuzluğu): {e}")
             continue
-        _jobs[rec.job_id] = rec
-        key = _cache_key(rec.query, rec.depth, rec.max_reviews)
-        _query_index[key] = rec.job_id
-    log.info(f"Diskten {len(_jobs)} job yüklendi (bugün)")
+        # Redis'e aktar
+        try:
+            await _save_job_to_redis(rec)
+            h = _cache_key_hash(rec.query, rec.depth, rec.max_reviews)
+            await _redis.set(f"qidx:{rec.date}:{h}", rec.job_id, ex=_REDIS_TTL)
+        except Exception as e:
+            log.warning(f"Disk→Redis aktarım hatası [{rec.job_id[:8]}]: {e}")
+        if rec.status == "pending":
+            log.info(f"Pending job için polling yeniden başlatılıyor: {rec.job_id[:8]}")
+            task = asyncio.create_task(_poll_and_finalize(rec))
+            _active_tasks.add(task)
+            task.add_done_callback(_active_tasks.discard)
+    log.info(f"Diskten {len(records)} job yüklendi ve Redis'e aktarıldı (bugün)")
 
 # ---------------------------------------------------------------------------
 # Daily cleanup — dünden eski klasörleri sil (bugün+dün korunur)
@@ -223,7 +314,6 @@ async def _daily_cleanup():
     today = date.today().isoformat()
     if _last_cleanup_date == today:
         return
-    # Yeni gün — hata sayacını sıfırla
     _cleanup_fail_count = 0
     _last_cleanup_date = today
 
@@ -232,8 +322,17 @@ async def _daily_cleanup():
 
     yesterday = (date.today() - timedelta(days=1)).isoformat()
 
-    # Aktif job tarihlerini topla — bu tarihlerin klasörlerini silme
-    active_dates = {r.date for r in _jobs.values() if r.status == "pending"}
+    # Aktif job tarihlerini Redis'ten al
+    active_dates = set()
+    try:
+        job_ids = await _redis.smembers(f"jobs:date:{today}")
+        if job_ids:
+            for jid in job_ids:
+                rec = await _get_job_from_redis(jid)
+                if rec and rec.status == "pending":
+                    active_dates.add(rec.date)
+    except Exception as e:
+        log.warning(f"Redis'ten aktif tarihler alınamadı: {e}")
 
     dirs_to_delete = []
     try:
@@ -258,43 +357,6 @@ async def _daily_cleanup():
             await asyncio.to_thread(shutil.rmtree, d)
         except Exception as e:
             log.warning(f"Klasör silinemedi {d}: {e}")
-
-    # Bellekteki eski kayıtları temizle (dün+bugün ve pending olanlar hariç)
-    stale_ids = [
-        jid for jid, r in _jobs.items()
-        if r.date < yesterday and r.status != "pending"
-    ]
-    for jid in stale_ids:
-        del _jobs[jid]
-    stale_keys = [
-        k for k, jid in _query_index.items()
-        if k[3] < yesterday and not (_jobs.get(jid) and _jobs[jid].status == "pending")
-    ]
-    for k in stale_keys:
-        del _query_index[k]
-
-    if stale_ids:
-        log.info(f"Bellekten {len(stale_ids)} eski job temizlendi")
-
-# ---------------------------------------------------------------------------
-# Overnight job cleanup helper
-# ---------------------------------------------------------------------------
-
-def _evict_stale_job(rec: JobRecord):
-    """Gece yarısını geçmiş bitmiş job'ları bellekten temizle."""
-    today = date.today().isoformat()
-    if rec.date == today:
-        return
-    # Job artık pending değil ve bugüne ait değil → bellekten sil
-    _jobs.pop(rec.job_id, None)
-    # _query_index'ten de temizle (eski tarihli key)
-    stale_keys = [
-        k for k, jid in _query_index.items()
-        if jid == rec.job_id
-    ]
-    for k in stale_keys:
-        del _query_index[k]
-    log.info(f"[{rec.job_id[:8]}] Gece yarısı geçmiş job bellekten temizlendi")
 
 # ---------------------------------------------------------------------------
 # Background polling
@@ -350,6 +412,7 @@ async def _poll_and_finalize(rec: JobRecord):
                     except Exception as e:
                         rec.status = "failed"
                         rec.error = f"CSV indirme hatası: {e}"
+                        await _save_job_to_redis(rec)
                         await _save_index(rec.date)
                         log.error(f"[{rec.job_id[:8]}] CSV indirilemedi: {e}")
                         return
@@ -373,6 +436,7 @@ async def _poll_and_finalize(rec: JobRecord):
                     except (OSError, ValueError) as e:
                         rec.status = "failed"
                         rec.error = f"Sonuç dosyası yazılamadı: {e}"
+                        await _save_job_to_redis(rec)
                         await _save_index(rec.date)
                         log.error(f"[{rec.job_id[:8]}] Diske yazma hatası: {e}")
                         return
@@ -380,21 +444,20 @@ async def _poll_and_finalize(rec: JobRecord):
                     # Önce veriyi set et, sonra status'u "ok" yap
                     rec.result_count = len(json_data)
                     rec.status = "ok"
+                    await _save_job_to_redis(rec)
                     await _save_index(rec.date)
                     log.info(
                         f"[{rec.job_id[:8]}] Tamamlandı: {rec.result_count} kayıt "
                         f"({poll_count} poll)"
                     )
-                    # Gece yarısını geçtiyse bellekten temizle
-                    _evict_stale_job(rec)
                     return
 
                 elif status in ("failed", "error"):
                     rec.status = "failed"
                     rec.error = data.get("error") or data.get("Error") or str(data)
+                    await _save_job_to_redis(rec)
                     await _save_index(rec.date)
                     log.error(f"[{rec.job_id[:8]}] Gosom hata: {rec.error}")
-                    _evict_stale_job(rec)
                     return
 
                 # pending / working → devam
@@ -403,9 +466,9 @@ async def _poll_and_finalize(rec: JobRecord):
         # Max poll aşıldı
         rec.status = "failed"
         rec.error = f"Timeout: {MAX_POLLS} poll sonra tamamlanmadı"
+        await _save_job_to_redis(rec)
         await _save_index(rec.date)
         log.error(f"[{rec.job_id[:8]}] Polling timeout")
-        _evict_stale_job(rec)
 
     except asyncio.CancelledError:
         log.info(f"[{rec.job_id[:8]}] Poll task iptal edildi")
@@ -414,10 +477,10 @@ async def _poll_and_finalize(rec: JobRecord):
         rec.error = str(e)
         log.exception(f"[{rec.job_id[:8]}] Beklenmeyen hata: {e}")
         try:
+            await _save_job_to_redis(rec)
             await _save_index(rec.date)
         except Exception as save_err:
-            log.error(f"[{rec.job_id[:8]}] Index kaydedilemedi: {save_err}")
-        _evict_stale_job(rec)
+            log.error(f"[{rec.job_id[:8]}] Redis/Index kaydedilemedi: {save_err}")
 
 # ---------------------------------------------------------------------------
 # Lifespan
@@ -425,17 +488,19 @@ async def _poll_and_finalize(rec: JobRecord):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    _load_todays_index()
-    await _daily_cleanup()
+    global _redis
 
-    # Pending job'lar için polling yeniden başlat
-    for rec in _jobs.values():
-        if rec.status == "pending":
-            log.info(f"Pending job için polling yeniden başlatılıyor: {rec.job_id[:8]}")
-            task = asyncio.create_task(_poll_and_finalize(rec))
-            _active_tasks.add(task)
-            task.add_done_callback(_active_tasks.discard)
+    # Startup — Redis bağlantısı
+    _redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        await _redis.ping()
+        log.info(f"Redis bağlantısı başarılı: {REDIS_URL}")
+    except Exception as e:
+        log.error(f"Redis bağlantı hatası: {e}")
+        raise
+
+    await _load_todays_index()
+    await _daily_cleanup()
 
     yield
 
@@ -444,6 +509,11 @@ async def lifespan(app: FastAPI):
         task.cancel()
     if _active_tasks:
         await asyncio.gather(*_active_tasks, return_exceptions=True)
+
+    # Redis bağlantısını kapat
+    if _redis:
+        await _redis.aclose()
+        log.info("Redis bağlantısı kapatıldı")
 
 # ---------------------------------------------------------------------------
 # App
@@ -475,11 +545,13 @@ async def create_job(body: dict):
 
     await _daily_cleanup()
 
-    key = _cache_key(query, depth, max_reviews)
+    today = date.today().isoformat()
+    h = _cache_key_hash(query, depth, max_reviews)
 
-    # Deduplication kontrolü
-    if key in _query_index:
-        existing = _jobs.get(_query_index[key])
+    # Deduplication kontrolü — Redis'ten
+    existing_job_id = await _redis.get(f"qidx:{today}:{h}")
+    if existing_job_id:
+        existing = await _get_job_from_redis(existing_job_id)
         if existing:
             if existing.status == "ok":
                 return UTF8JSONResponse(
@@ -501,13 +573,14 @@ async def create_job(body: dict):
                 )
             # status == "failed" → yeniden dene (aşağıya devam)
 
-    # Race condition koruması: aynı key için eşzamanlı oluşturma engelle
-    if key in _creating_keys:
+    # Distributed lock — race condition koruması
+    lock_key = f"lock:{h}"
+    acquired = await _redis.set(lock_key, "1", nx=True, ex=30)
+    if not acquired:
         raise HTTPException(
             status_code=409,
             detail="Bu sorgu için job zaten oluşturuluyor, lütfen biraz bekleyin",
         )
-    _creating_keys.add(key)
 
     try:
         # Gosom'a POST
@@ -554,11 +627,22 @@ async def create_job(body: dict):
             max_reviews=max_reviews,
             status="pending",
             created_at=datetime.now().isoformat(),
-            date=date.today().isoformat(),
+            date=today,
         )
 
-        _jobs[job_id] = rec
-        _query_index[key] = job_id
+        # Redis'e kaydet — Gosom job zaten oluşturuldu, bu başarısız olursa
+        # job orphan kalır ama retry ile kurtarılabilir
+        try:
+            await _save_job_to_redis(rec)
+            await _redis.set(f"qidx:{today}:{h}", job_id, ex=_REDIS_TTL)
+        except Exception as redis_err:
+            log.error(f"[{job_id[:8]}] Redis kayıt başarısız (Gosom job orphan kalabilir): {redis_err}")
+            raise HTTPException(
+                status_code=503,
+                detail="Job oluşturuldu ancak kaydedilemedi, lütfen tekrar deneyin",
+            )
+
+        # Disk backup
         await _save_index(rec.date)
 
         # Background poll başlat
@@ -571,7 +655,10 @@ async def create_job(body: dict):
             status_code=201,
         )
     finally:
-        _creating_keys.discard(key)
+        try:
+            await _redis.delete(lock_key)
+        except Exception:
+            pass  # Lock TTL=30s ile zaten expire olacak
 
 # ---------------------------------------------------------------------------
 # GET /api/jobs — Bugünün tüm job'larını listele
@@ -581,9 +668,12 @@ async def create_job(body: dict):
 async def list_jobs():
     await _daily_cleanup()
     today = date.today().isoformat()
+
+    job_ids = await _redis.smembers(f"jobs:date:{today}")
     jobs = []
-    for rec in _jobs.values():
-        if rec.date != today:
+    for jid in job_ids:
+        rec = await _get_job_from_redis(jid)
+        if not rec or rec.date != today:
             continue
         item = {
             "job_id": rec.job_id,
@@ -610,7 +700,7 @@ async def get_job(job_id: str):
     except ValueError:
         raise HTTPException(status_code=400, detail="Geçersiz job_id formatı")
 
-    rec = _jobs.get(job_id)
+    rec = await _get_job_from_redis(job_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Job bulunamadı")
 
@@ -639,7 +729,7 @@ async def get_result(job_id: str):
     except ValueError:
         raise HTTPException(status_code=400, detail="Geçersiz job_id formatı")
 
-    rec = _jobs.get(job_id)
+    rec = await _get_job_from_redis(job_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Job bulunamadı")
 
