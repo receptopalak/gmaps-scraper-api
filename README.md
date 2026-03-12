@@ -1,57 +1,254 @@
 # gmaps-scraper-api
 
-Async job-based REST API wrapper for Google Maps scraping. Built on top of [gosom/google-maps-scraper](https://github.com/gosom/google-maps-scraper), it provides a non-blocking job queue with polling, automatic CSV-to-JSON conversion, query deduplication, disk persistence, and daily cleanup.
+Google Maps sonuçlarını job tabanlı şekilde toplayan bir REST API servisidir. Bu servis, [gosom/google-maps-scraper](https://github.com/gosom/google-maps-scraper) üzerine kuruludur ve scraping işini arka planda yürütür. Sen istemci tarafında sadece job oluşturur, durumu kontrol eder ve sonuçları alırsın.
 
-## How It Works
+Bu README, uygulamaya nasıl istek atacağını, hangi endpoint'in ne işe yaradığını, hangi parametrelere hangi değerleri verebileceğini ve hangi cevapları beklemen gerektiğini detaylı şekilde anlatır.
 
+## İçindekiler
+
+- [Genel Akış](#genel-akış)
+- [Base URL](#base-url)
+- [Swagger ve OpenAPI](#swagger-ve-openapi)
+- [Hızlı Başlangıç](#hızlı-başlangıç)
+- [Neler Yapabilirsin](#neler-yapabilirsin)
+- [API Özeti](#api-özeti)
+- [1. Job Oluşturma](#1-job-oluşturma)
+- [2. Tek Job Durumu Sorgulama](#2-tek-job-durumu-sorgulama)
+- [3. Sonucu Dosya Olarak Alma](#3-sonucu-dosya-olarak-alma)
+- [4. Sonucu Direkt JSON Olarak Alma](#4-sonucu-direkt-json-olarak-alma)
+- [5. Bugünkü Tüm Job'ları Listeleme](#5-bugünkü-tüm-jobları-listeleme)
+- [Parametreler](#parametreler)
+- [Response Alanları](#response-alanları)
+- [Job Durumları](#job-durumları)
+- [Hata Kodları ve Anlamları](#hata-kodları-ve-anlamları)
+- [Yaygın Kullanım Senaryoları](#yaygın-kullanım-senaryoları)
+- [JavaScript Örnekleri](#javascript-örnekleri)
+- [Python Örnekleri](#python-örnekleri)
+- [Deduplication Davranışı](#deduplication-davranışı)
+- [Sistem Davranışı ve Limitler](#sistem-davranışı-ve-limitler)
+- [Ortam Değişkenleri](#ortam-değişkenleri)
+- [Yerel Geliştirme](#yerel-geliştirme)
+- [Dosya Yapısı](#dosya-yapısı)
+
+## Genel Akış
+
+Bu API senkron çalışmaz. Yani `POST /api/jobs` attığında scraping bitene kadar beklemez. Bunun yerine bir `job_id` üretir ve arka planda scraping başlar.
+
+Akış şu şekildedir:
+
+```text
+1. Client -> POST /api/jobs
+2. API -> job_id döner
+3. API arka planda Gosom'u poll eder
+4. İş bitince CSV indirir, JSON'a çevirir, diske kaydeder
+5. Client -> GET /api/jobs/{job_id}
+6. Status "ok" olduğunda client -> /result veya /result/json çağırır
 ```
-Client ──POST /api/jobs──> Wrapper ──POST──> Gosom   (returns 201 immediately)
-                                      │
-                          Background task (asyncio):
-                              poll gosom status
-                              download CSV
-                              convert to JSON
-                              save to disk
-                                      │
-Client ──GET /api/jobs/{id}──> Wrapper  →  "pending" | "ok" | "failed"
-Client ──GET /api/jobs/{id}/result──> Wrapper  →  JSON file
+
+Kısaca:
+
+- Job oluşturursun
+- `job_id` alırsın
+- Durum sorgularsın
+- Sonucu indirirsin veya direkt JSON olarak alırsın
+
+## Base URL
+
+Production örneği:
+
+```text
+https://scraper.geolocalrank.com
 ```
 
-Instead of blocking the HTTP connection for minutes while scraping completes, the wrapper returns immediately with a `job_id`. The client polls for status and downloads results when ready.
+Local örneği:
 
-## Quick Start
+```text
+http://localhost:8003
+```
+
+Bu README’de örneklerde `BASE_URL` değişkeni kullanılmıştır:
 
 ```bash
-git clone https://github.com/receptopalak/gmaps-scraper-api.git
-cd gmaps-scraper-api
-docker-compose up -d --build
+BASE_URL=https://scraper.geolocalrank.com
 ```
 
-This starts two services:
-- **Gosom scraper** on port `8085`
-- **Wrapper API** on port `8003`
-
-For Redis, the wrapper reads `REDIS_URL` first. If that is not set, it falls back to `REDIS_HOST`, `REDIS_PORT`, and `REDIS_DB`.
-
-Example Kubernetes setting:
-
-```yaml
-env:
-  - name: REDIS_URL
-    value: redis://redis:6379/0
-```
-
-## API Reference
-
-### Create a Job
+Local çalışıyorsan:
 
 ```bash
-curl -X POST http://localhost:8003/api/jobs \
+BASE_URL=http://localhost:8003
+```
+
+## Swagger ve OpenAPI
+
+Canlı dokümantasyon:
+
+```text
+https://scraper.geolocalrank.com/docs
+```
+
+OpenAPI şeması:
+
+```text
+https://scraper.geolocalrank.com/openapi.json
+```
+
+Swagger arayüzü endpoint’leri denemek için faydalıdır, ama gerçek entegrasyon için aşağıdaki örnekler daha nettir.
+
+## Hızlı Başlangıç
+
+En kısa kullanım akışı:
+
+```bash
+BASE_URL=https://scraper.geolocalrank.com
+
+curl -X POST "$BASE_URL/api/jobs" \
   -H 'Content-Type: application/json' \
-  -d '{"query": "restaurants istanbul", "depth": 1, "max_reviews": 10}'
+  -d '{"query":"bakery istanbul","depth":1,"max_reviews":5}'
 ```
 
-**Response (201):**
+Örnek cevap:
+
+```json
+{
+  "job_id": "a7a7d3ef-3119-4c83-80db-233484e2838d",
+  "status": "pending"
+}
+```
+
+Sonra:
+
+```bash
+curl "$BASE_URL/api/jobs/a7a7d3ef-3119-4c83-80db-233484e2838d"
+```
+
+İş bittiğinde:
+
+```bash
+curl "$BASE_URL/api/jobs/a7a7d3ef-3119-4c83-80db-233484e2838d/result/json"
+```
+
+## Neler Yapabilirsin
+
+Bu API ile şunları yapabilirsin:
+
+- Google Maps'te bir anahtar kelime veya işletme araması başlatmak
+- Aynı sorguyu tekrar attığında cache/dedup sayesinde mevcut sonucu almak
+- Bir job'ın tamamlanıp tamamlanmadığını kontrol etmek
+- Sonucu dosya gibi indirmek
+- Sonucu direkt JSON body olarak almak
+- Bugün açılmış tüm job'ları listelemek
+
+Örnek sorgular:
+
+- `restaurants istanbul`
+- `bakery kadikoy`
+- `dentist ankara`
+- `cafes izmir`
+- `villamore trabzon`
+- `avukat beşiktaş`
+
+Çok replica'lı deployment notu:
+
+- Sonuç JSON'u artık Redis'te tutulur ve tüm pod'lar aynı sonucu buradan servis eder
+- Disk yazımı sadece backup amaçlıdır
+- Bu sayede rollout, pod restart veya 2+ replica senaryolarında sonuçlar tek pod diskine bağımlı kalmaz
+
+## API Özeti
+
+| Method | Endpoint | Açıklama |
+|---|---|---|
+| `POST` | `/api/jobs` | Yeni scraping job'ı oluşturur |
+| `GET` | `/api/jobs` | Bugün oluşturulan tüm job'ları listeler |
+| `GET` | `/api/jobs/{job_id}` | Tek job'ın durumunu döner |
+| `GET` | `/api/jobs/{job_id}/result` | Sonucu dosya indirme davranışıyla döner |
+| `GET` | `/api/jobs/{job_id}/result/json` | Sonucu direkt JSON olarak döner |
+
+## 1. Job Oluşturma
+
+Endpoint:
+
+```text
+POST /api/jobs
+```
+
+Amaç:
+
+- Yeni bir scraping işi başlatmak
+- Aynı sorgu bugün daha önce çalıştıysa mevcut job'ı kullanmak
+
+### Request Body
+
+```json
+{
+  "query": "restaurants istanbul",
+  "depth": 1,
+  "max_reviews": 10
+}
+```
+
+### Parametre Açıklamaları
+
+| Alan | Tip | Zorunlu | Varsayılan | Geçerli Aralık | Açıklama |
+|---|---|---|---|---|---|
+| `query` | string | Evet | Yok | Boş olamaz | Google Maps arama sorgusu |
+| `depth` | integer | Hayır | `1` | `1-10` | Kaç seviye/kaç sayfa derine gidileceği |
+| `max_reviews` | integer | Hayır | `10` | `0-500` | Her işletme için maksimum review sayısı |
+
+### `query` İçin Ne Yazılır
+
+`query`, Google Maps'te manuel aratabileceğin metindir.
+
+Doğru örnekler:
+
+```text
+restaurants istanbul
+bakery beşiktaş
+dentist ankara
+hotel trabzon
+villamore trabzon
+```
+
+Dikkat:
+
+- Şehir eklemek çoğu zaman daha doğru sonuç verir
+- Semt veya ilçe eklemek sonucu netleştirir
+- Marka veya işletme adını tek başına da kullanabilirsin
+
+### `depth` Ne İşe Yarar
+
+`depth`, aramanın ne kadar derine gideceğini belirler.
+
+Genel yaklaşım:
+
+- `1`: hızlı ve hafif sorgular
+- `2-3`: daha geniş kapsama
+- `4+`: daha yavaş ama daha fazla sonuç potansiyeli
+
+Örnek:
+
+```json
+{
+  "query": "cafes istanbul",
+  "depth": 3,
+  "max_reviews": 20
+}
+```
+
+### `max_reviews` Ne İşe Yarar
+
+Her işletme için toplanacak review sayısını sınırlar.
+
+Örnek kullanım:
+
+- `0`: sadece işletme verisi, review istemiyorsan
+- `10`: hafif kullanım
+- `50`: orta seviye veri
+- `100+`: daha ağır iş yükü
+
+### Başarılı Yeni Job Cevabı
+
+HTTP `201`
+
 ```json
 {
   "job_id": "97c9ed6c-7e52-4c74-aa34-d18a16b9dd48",
@@ -59,26 +256,82 @@ curl -X POST http://localhost:8003/api/jobs \
 }
 ```
 
-**Parameters:**
+### Aynı Sorgu Daha Önce Varsa
 
-| Parameter | Type | Default | Range | Description |
-|-----------|------|---------|-------|-------------|
-| `query` | string | *required* | - | Google Maps search query |
-| `depth` | int | 1 | 1-10 | Search depth (pages to scrape) |
-| `max_reviews` | int | 10 | 0-500 | Maximum reviews per place |
+Eğer aynı gün içinde aynı `query + depth + max_reviews` kombinasyonu zaten oluşturulduysa servis yeni job açmayabilir.
 
-**Deduplication:** If the same query (case-insensitive) with the same parameters was already submitted today:
-- Completed job → returns `200` with `download_url` and `result_url` (no new scraping)
-- Pending job → returns `200` with `status: "pending"` (no duplicate job)
-- Failed job → creates a new job (retry)
+Tamamlanmış job örneği:
 
-### Check Job Status
+HTTP `200`
 
-```bash
-curl http://localhost:8003/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48
+```json
+{
+  "job_id": "97c9ed6c-7e52-4c74-aa34-d18a16b9dd48",
+  "status": "ok",
+  "result_count": 20,
+  "download_url": "/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48/result",
+  "result_url": "/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48/result/json"
+}
 ```
 
-**Response (200):**
+Henüz bitmemiş job örneği:
+
+HTTP `200`
+
+```json
+{
+  "job_id": "97c9ed6c-7e52-4c74-aa34-d18a16b9dd48",
+  "status": "pending"
+}
+```
+
+### cURL Örneği
+
+```bash
+curl -X POST "$BASE_URL/api/jobs" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"restaurants istanbul","depth":1,"max_reviews":10}'
+```
+
+### Olası Hatalar
+
+- `400`: body yanlış veya eksik
+- `409`: aynı sorgu için job oluşturulurken race condition oluştu
+- `502`: Gosom tarafına ulaşılamadı veya job açılamadı
+- `503`: job açıldı ama Redis'e kaydedilemedi
+
+## 2. Tek Job Durumu Sorgulama
+
+Endpoint:
+
+```text
+GET /api/jobs/{job_id}
+```
+
+Amaç:
+
+- Tek bir job'ın şu anki durumunu öğrenmek
+- Sonuç hazırsa `download_url` ve `result_url` almak
+
+### Örnek İstek
+
+```bash
+curl "$BASE_URL/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48"
+```
+
+### `pending` Cevabı
+
+```json
+{
+  "job_id": "97c9ed6c-7e52-4c74-aa34-d18a16b9dd48",
+  "query": "restaurants istanbul",
+  "status": "pending",
+  "created_at": "2026-03-09T14:28:36.061990"
+}
+```
+
+### `ok` Cevabı
+
 ```json
 {
   "job_id": "97c9ed6c-7e52-4c74-aa34-d18a16b9dd48",
@@ -91,144 +344,549 @@ curl http://localhost:8003/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48
 }
 ```
 
-**Status values:**
+### `failed` Cevabı
 
-| Status | Meaning |
-|--------|---------|
-| `pending` | Job created, scraping in progress |
-| `ok` | Completed, results ready to download |
-| `failed` | Error occurred (see `error` field) |
+```json
+{
+  "job_id": "97c9ed6c-7e52-4c74-aa34-d18a16b9dd48",
+  "query": "restaurants istanbul",
+  "status": "failed",
+  "created_at": "2026-03-09T14:28:36.061990",
+  "error": "CSV indirme hatası: timeout"
+}
+```
 
-### Download Results
+### Olası Hatalar
+
+- `400`: `job_id` formatı geçersiz
+- `404`: job bulunamadı
+
+## 3. Sonucu Dosya Olarak Alma
+
+Endpoint:
+
+```text
+GET /api/jobs/{job_id}/result
+```
+
+Amaç:
+
+- Sonucu dosya gibi almak
+- Tarayıcı veya client bunu indirme davranışıyla ele alabilir
+
+### Örnek İstek
 
 ```bash
-curl http://localhost:8003/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48/result
+curl "$BASE_URL/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48/result"
 ```
 
-### Get Results Inline
+Dosyaya yazmak istersen:
 
 ```bash
-curl http://localhost:8003/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48/result/json
+curl "$BASE_URL/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48/result" -o result.json
 ```
 
-Returns the same JSON payload inline, without forcing a file download.
+### Ne Döner
 
-Returns a JSON array of place objects. Each object includes:
+- Job bitmişse JSON içeriği
+- Job henüz bitmemişse `202`
+- Job başarısızsa `422`
+- Sonuç dosyası silinmişse `410`
 
-- `title`, `category`, `address`, `phone`, `website`
-- `review_count`, `review_rating`, `reviews_per_rating`
-- `latitude`, `longitude`
-- `open_hours`, `popular_times`
-- `images`, `about`, `user_reviews`
-- `owner`, `complete_address`
-- Full UTF-8 support (Turkish characters, emojis, etc.)
+## 4. Sonucu Direkt JSON Olarak Alma
 
-**Status codes:**
+Endpoint:
 
-| Code | Meaning |
-|------|---------|
-| 200 | JSON result file |
-| 202 | Job still pending |
-| 404 | Job not found |
-| 410 | Result file was cleaned up |
-| 422 | Job failed |
+```text
+GET /api/jobs/{job_id}/result/json
+```
 
-### List All Jobs
+Amaç:
+
+- Sonucu doğrudan JSON response olarak almak
+- API entegrasyonlarında çoğu zaman tercih edilen endpoint budur
+
+### Örnek İstek
 
 ```bash
-curl http://localhost:8003/api/jobs
+curl "$BASE_URL/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48/result/json"
 ```
 
-Returns all jobs created today.
+Biçimlendirilmiş görmek için:
 
-## Architecture
-
-### File Structure
-
-```
-gmaps-scraper-api/
-  wrapper.py           # FastAPI application (single file)
-  Dockerfile           # Python 3.12-slim + uvicorn
-  docker-compose.yml   # Gosom + Wrapper orchestration
-  requirements.txt     # fastapi, uvicorn, httpx
-  gmapsdata/           # Shared volume between services
-    json/
-      2026-03-09/
-        index.json     # Today's job registry
-        <job-id>.json  # Parsed JSON results
+```bash
+curl -s "$BASE_URL/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48/result/json" | python -m json.tool
 ```
 
-### Key Features
+### Başarılı Cevap Örneği
 
-- **Non-blocking**: POST returns immediately, background asyncio task handles polling
-- **Disk persistence**: Results saved to `gmapsdata/json/YYYY-MM-DD/` with atomic writes
-- **Restart recovery**: On startup, `index.json` is reloaded and pending jobs resume polling
-- **Query deduplication**: Same query today returns cached result or existing pending job
-- **Daily cleanup**: Directories older than yesterday are automatically deleted
-- **Thread-safe I/O**: All disk writes run in `asyncio.to_thread()` to avoid blocking the event loop
-- **Path traversal protection**: Job IDs validated against strict UUID regex, paths checked with `is_relative_to()`
+```json
+[
+  {
+    "title": "Cafe Example",
+    "category": "Cafe",
+    "address": "Istanbul",
+    "phone": "+90 ...",
+    "website": "https://example.com",
+    "review_count": 120,
+    "review_rating": 4.6,
+    "latitude": 41.0082,
+    "longitude": 28.9784
+  }
+]
+```
 
-### Environment Variables
+### Olası Hatalar
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GOSOM_API_URL` | `http://localhost:8080/api/v1` | Gosom scraper API URL |
-| `DATA_ROOT` | `gmapsdata/json` | Directory for JSON result storage |
+- `202`: job henüz tamamlanmadı
+- `400`: `job_id` formatı geçersiz
+- `404`: job bulunamadı
+- `410`: sonuç dosyası yok
+- `422`: job başarısız
 
-### Polling Behavior
+## 5. Bugünkü Tüm Job'ları Listeleme
 
-The wrapper polls gosom with an adaptive interval:
-- Starts at **1 second**
-- Increases by **0.5s** per poll up to **3 seconds**
-- Maximum **720 polls** (~36 minute timeout)
+Endpoint:
 
-### Gosom Status Mapping
+```text
+GET /api/jobs
+```
 
-| Gosom Status | Wrapper Action |
+Amaç:
+
+- Bugün oluşturulmuş tüm job'ları görmek
+- Toplu takip yapmak
+
+### Örnek İstek
+
+```bash
+curl "$BASE_URL/api/jobs"
+```
+
+### Örnek Cevap
+
+```json
+[
+  {
+    "job_id": "11111111-1111-1111-1111-111111111111",
+    "query": "restaurants istanbul",
+    "status": "pending",
+    "created_at": "2026-03-12T11:40:13.249794"
+  },
+  {
+    "job_id": "22222222-2222-2222-2222-222222222222",
+    "query": "dentist ankara",
+    "status": "ok",
+    "created_at": "2026-03-12T10:15:00.000000",
+    "result_count": 15,
+    "download_url": "/api/jobs/22222222-2222-2222-2222-222222222222/result",
+    "result_url": "/api/jobs/22222222-2222-2222-2222-222222222222/result/json"
+  },
+  {
+    "job_id": "33333333-3333-3333-3333-333333333333",
+    "query": "hotel trabzon",
+    "status": "failed",
+    "created_at": "2026-03-12T09:00:00.000000",
+    "error": "CSV indirme hatası: timeout"
+  }
+]
+```
+
+Not:
+
+- Bu endpoint sadece bugünkü job'ları döner
+- Geçmiş günlerin sonuçları burada görünmeyebilir
+
+## Parametreler
+
+### `query`
+
+- Tip: `string`
+- Zorunlu: evet
+- Boş olamaz
+
+Örnekler:
+
+```text
+restaurants istanbul
+bakery kadikoy
+hotel trabzon
+villamore trabzon
+```
+
+### `depth`
+
+- Tip: `integer`
+- Zorunlu: hayır
+- Varsayılan: `1`
+- Min: `1`
+- Max: `10`
+
+Öneri:
+
+- Basit kullanım için `1`
+- Daha geniş sonuç için `2` veya `3`
+- Gereksiz yere çok yükseltme, iş süresini artırır
+
+### `max_reviews`
+
+- Tip: `integer`
+- Zorunlu: hayır
+- Varsayılan: `10`
+- Min: `0`
+- Max: `500`
+
+Öneri:
+
+- Hafif kullanım için `0-10`
+- Normal kullanım için `10-50`
+- Ağır kullanım için `100+`
+
+## Response Alanları
+
+| Alan | Ne zaman gelir | Açıklama |
+|---|---|---|
+| `job_id` | Her zaman | Job kimliği |
+| `query` | Job detay cevaplarında | Arama sorgusu |
+| `status` | Her zaman | `pending`, `ok`, `failed` |
+| `created_at` | Job detay/listede | Oluşturulma zamanı, ISO format |
+| `result_count` | Sadece `ok` durumunda | Sonuç sayısı |
+| `download_url` | Sadece `ok` durumunda | Dosya gibi sonuç alma endpoint'i |
+| `result_url` | Sadece `ok` durumunda | Direkt JSON alma endpoint'i |
+| `error` | Sadece `failed` durumunda | Hata detayı |
+
+## Job Durumları
+
+| Durum | Anlamı |
 |---|---|
-| `pending` | Continue polling |
-| `working` | Continue polling |
-| `ok` | Download CSV, convert to JSON, save to disk |
-| `failed` | Mark job as failed with error message |
+| `pending` | Job oluşturuldu, scraping sürüyor |
+| `ok` | Job tamamlandı, sonuç hazır |
+| `failed` | İş başarısız oldu |
 
-## Local Development (without Docker)
+## Hata Kodları ve Anlamları
+
+| Kod | Nerede | Anlamı |
+|---|---|---|
+| `200` | GET ve dedupe POST | Başarılı |
+| `201` | Yeni POST | Yeni job oluşturuldu |
+| `202` | `/result` ve `/result/json` | Job henüz tamamlanmadı |
+| `400` | Birçok endpoint | Geçersiz input veya `job_id` |
+| `404` | Job endpoint'leri | Job bulunamadı |
+| `409` | `POST /api/jobs` | Aynı sorgu için job o anda oluşturuluyor |
+| `410` | Result endpoint'leri | Sonuç dosyası silinmiş |
+| `422` | Result endpoint'leri | Job başarısız durumda |
+| `502` | `POST /api/jobs` | Gosom tarafında hata |
+| `503` | `POST /api/jobs` | Redis kayıt problemi |
+
+## Yaygın Kullanım Senaryoları
+
+### Senaryo 1: Yeni job oluştur, tamamlanana kadar bekle, sonucu al
 
 ```bash
-# Terminal 1: Start gosom (requires Docker)
-docker run -p 8080:8080 -v ./gmapsdata:/gmapsdata gosom/google-maps-scraper:latest -data-folder /gmapsdata
+BASE_URL=https://scraper.geolocalrank.com
 
-# Terminal 2: Start wrapper
-pip install fastapi uvicorn[standard] httpx
-uvicorn wrapper:app --host 0.0.0.0 --port 8000 --reload
-```
-
-## Example: Full Workflow
-
-```bash
-# 1. Create a job
-JOB_ID=$(curl -s -X POST http://localhost:8003/api/jobs \
+JOB_ID=$(curl -s -X POST "$BASE_URL/api/jobs" \
   -H 'Content-Type: application/json' \
-  -d '{"query":"Villamore Trabzon","depth":1,"max_reviews":10}' | python -m json.tool --no-ensure-ascii | grep job_id | cut -d'"' -f4)
+  -d '{"query":"villamore trabzon","depth":1,"max_reviews":10}' | python -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
 
-echo "Job ID: $JOB_ID"
+echo "JOB_ID=$JOB_ID"
 
-# 2. Poll until complete
 while true; do
-  STATUS=$(curl -s http://localhost:8003/api/jobs/$JOB_ID | python -c "import sys,json; print(json.load(sys.stdin)['status'])")
-  echo "Status: $STATUS"
+  STATUS=$(curl -s "$BASE_URL/api/jobs/$JOB_ID" | python -c "import sys,json; print(json.load(sys.stdin)['status'])")
+  echo "STATUS=$STATUS"
   [ "$STATUS" != "pending" ] && break
   sleep 3
 done
 
-# 3. Download results
-curl -s http://localhost:8003/api/jobs/$JOB_ID/result | python -m json.tool --no-ensure-ascii
-
-# 4. Same query again — instant cache hit
-curl -s -X POST http://localhost:8003/api/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"Villamore Trabzon","depth":1,"max_reviews":10}' | python -m json.tool
+curl -s "$BASE_URL/api/jobs/$JOB_ID/result/json" | python -m json.tool
 ```
 
-## License
+### Senaryo 2: Aynı sorguyu tekrar at
+
+```bash
+curl -X POST "$BASE_URL/api/jobs" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"villamore trabzon","depth":1,"max_reviews":10}'
+```
+
+Eğer aynı gün içinde aynı istek daha önce tamamlandıysa çoğu zaman doğrudan `status: ok` ile mevcut job döner.
+
+### Senaryo 3: Sonucu dosya olarak indir
+
+```bash
+curl "$BASE_URL/api/jobs/$JOB_ID/result" -o result.json
+```
+
+### Senaryo 4: Tüm bugünkü job'ları listele
+
+```bash
+curl "$BASE_URL/api/jobs" | python -m json.tool
+```
+
+## JavaScript Örnekleri
+
+### Fetch ile job oluşturma
+
+```js
+const baseUrl = "https://scraper.geolocalrank.com";
+
+const response = await fetch(`${baseUrl}/api/jobs`, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    query: "restaurants istanbul",
+    depth: 1,
+    max_reviews: 10,
+  }),
+});
+
+const data = await response.json();
+console.log(data);
+```
+
+### Fetch ile polling
+
+```js
+const baseUrl = "https://scraper.geolocalrank.com";
+
+async function waitForJob(jobId) {
+  while (true) {
+    const res = await fetch(`${baseUrl}/api/jobs/${jobId}`);
+    const data = await res.json();
+
+    if (data.status === "ok") {
+      return data;
+    }
+
+    if (data.status === "failed") {
+      throw new Error(data.error || "Job failed");
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+}
+```
+
+### Fetch ile sonucu alma
+
+```js
+const resultRes = await fetch(`${baseUrl}/api/jobs/${jobId}/result/json`);
+
+if (resultRes.status === 202) {
+  console.log("Henüz hazır değil");
+} else if (!resultRes.ok) {
+  throw new Error(`HTTP ${resultRes.status}`);
+} else {
+  const result = await resultRes.json();
+  console.log(result);
+}
+```
+
+## Python Örnekleri
+
+### `requests` ile kullanım
+
+```python
+import time
+import requests
+
+BASE_URL = "https://scraper.geolocalrank.com"
+
+create_res = requests.post(
+    f"{BASE_URL}/api/jobs",
+    json={
+        "query": "restaurants istanbul",
+        "depth": 1,
+        "max_reviews": 10,
+    },
+    timeout=30,
+)
+create_res.raise_for_status()
+job = create_res.json()
+job_id = job["job_id"]
+
+while True:
+    status_res = requests.get(f"{BASE_URL}/api/jobs/{job_id}", timeout=30)
+    status_res.raise_for_status()
+    status_data = status_res.json()
+
+    if status_data["status"] == "ok":
+        break
+
+    if status_data["status"] == "failed":
+        raise RuntimeError(status_data.get("error", "Job failed"))
+
+    time.sleep(3)
+
+result_res = requests.get(f"{BASE_URL}/api/jobs/{job_id}/result/json", timeout=120)
+result_res.raise_for_status()
+data = result_res.json()
+print(data)
+```
+
+## Deduplication Davranışı
+
+Bu servis aynı gün içinde aynı sorguyu tekrar tekrar çalıştırmamak için deduplication yapar.
+
+Dedup key şu alanlardan oluşur:
+
+- `query`
+- `depth`
+- `max_reviews`
+- bugünün tarihi
+
+Bunun anlamı:
+
+- Bugün aynı sorguyu tekrar atarsan yeni job açılmayabilir
+- Yarın aynı sorgu atılırsa yeni job açılabilir
+- `depth` veya `max_reviews` değişirse yeni job oluşur
+
+Örnek:
+
+```json
+{"query":"bakery istanbul","depth":1,"max_reviews":10}
+```
+
+ile
+
+```json
+{"query":"bakery istanbul","depth":2,"max_reviews":10}
+```
+
+aynı job sayılmaz.
+
+## Sistem Davranışı ve Limitler
+
+Bilmen gereken bazı noktalar:
+
+- Servis scraping işini senkron değil asenkron yapar
+- Sonuçlar öncelikle Redis'te tutulur
+- Disk yazımı sadece backup amaçlı yapılır
+- Eski klasörler temizlenir
+- Sonuçlar bugüne göre indexlenir
+- `job_id` UUID formatındadır
+- Çok yoğun eşzamanlı trafikte aynı sorgu için `409` alabilirsin
+
+Polling davranışı:
+
+- 1 saniyeden başlar
+- her turda 0.5 saniye artar
+- maksimum 3 saniyeye kadar çıkar
+- en fazla 720 poll yapılır
+
+Yaklaşık timeout:
+
+- yaklaşık 36 dakika
+
+Çoklu replica davranışı:
+
+- `2+` replica ile çalışabilir
+- Sonuç endpoint'leri dosyayı yerel pod diskinde aramak zorunda değildir
+- Bir pod job'ı tamamladığında diğer pod'lar da sonucu Redis üzerinden dönebilir
+- Disk backup kaybolsa bile Redis TTL süresi boyunca sonuç servis edilmeye devam eder
+
+## Ortam Değişkenleri
+
+| Değişken | Varsayılan | Açıklama |
+|---|---|---|
+| `GOSOM_API_URL` | `http://localhost:8080/api/v1` | Gosom servis adresi |
+| `DATA_ROOT` | `gmapsdata/json` | Sonuç JSON dosyalarının klasörü |
+| `REDIS_URL` | `redis://localhost:6379/0` veya türetilen değer | Redis bağlantı adresi |
+| `REDIS_HOST` | `localhost` | `REDIS_URL` yoksa kullanılır |
+| `REDIS_PORT` | `6379` | `REDIS_URL` yoksa kullanılır |
+| `REDIS_DB` | `0` | `REDIS_URL` yoksa kullanılır |
+
+Kubernetes örneği:
+
+```yaml
+env:
+  - name: REDIS_URL
+    value: redis://:supersecretredis@redis-master.databases.svc.cluster.local:6379/0
+```
+
+## Yerel Geliştirme
+
+### Docker Compose ile
+
+```bash
+git clone https://github.com/receptopalak/gmaps-scraper-api.git
+cd gmaps-scraper-api
+docker-compose up -d --build
+```
+
+Servisler:
+
+- Gosom scraper: `http://localhost:8085`
+- Wrapper API: `http://localhost:8003`
+
+### Docker olmadan wrapper çalıştırma
+
+```bash
+pip install -r requirements.txt
+uvicorn wrapper:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Not:
+
+- Gosom ve Redis ayrıca erişilebilir olmalı
+- Environment variable'lar doğru set edilmeli
+
+## Dosya Yapısı
+
+```text
+gmaps-scraper-api/
+  wrapper.py
+  Dockerfile
+  docker-compose.yml
+  requirements.txt
+  tests/
+  gmapsdata/
+    json/
+      YYYY-MM-DD/
+        index.json
+        <job-id>.json
+```
+
+Klasör anlamları:
+
+- `wrapper.py`: FastAPI uygulaması
+- `docker-compose.yml`: local orkestrasyon
+- `gmapsdata/json/YYYY-MM-DD/`: sonuçların saklandığı klasör
+- `index.json`: o günün job kayıtlarının yedeği
+
+## Tam Örnek Akış
+
+```bash
+BASE_URL=https://scraper.geolocalrank.com
+
+# 1. Job oluştur
+JOB_ID=$(curl -s -X POST "$BASE_URL/api/jobs" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"restaurants istanbul","depth":1,"max_reviews":10}' | python -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
+
+echo "JOB_ID=$JOB_ID"
+
+# 2. Durumu izle
+while true; do
+  RESP=$(curl -s "$BASE_URL/api/jobs/$JOB_ID")
+  STATUS=$(echo "$RESP" | python -c "import sys,json; print(json.load(sys.stdin)['status'])")
+  echo "$RESP"
+  [ "$STATUS" != "pending" ] && break
+  sleep 3
+done
+
+# 3. Sonucu direkt JSON olarak al
+curl -s "$BASE_URL/api/jobs/$JOB_ID/result/json" | python -m json.tool
+
+# 4. Sonucu dosya olarak indir
+curl "$BASE_URL/api/jobs/$JOB_ID/result" -o result.json
+
+# 5. Bugünkü tüm job'ları listele
+curl -s "$BASE_URL/api/jobs" | python -m json.tool
+```
+
+## Lisans
 
 MIT

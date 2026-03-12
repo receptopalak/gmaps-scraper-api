@@ -1,16 +1,16 @@
 version: '3.8'
 
 services:
-  # 1. Redis Servisi (Hata aldığın eksik parça)
+  # 1. Redis
   redis:
     image: redis:alpine
     container_name: redis_cache
     restart: unless-stopped
     ports:
       - "6379:6379"
-    # Verilerin silinmemesini istersen alttaki satırı aktif edebilirsin
-    # volumes:
-    #   - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
 
   # 2. Google Maps Scraper
   gmaps-scraper:
@@ -42,5 +42,5 @@ services:
       - redis
     restart: unless-stopped
 
-# volumes:
-#   redis_data:
+volumes:
+  redis_data:

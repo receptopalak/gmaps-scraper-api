@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, Response
 import httpx
 import redis.asyncio as aioredis
 
@@ -188,11 +188,9 @@ def _job_result_urls(job_id: str) -> dict[str, str]:
     }
 
 
-def _get_result_file_or_raise(rec: JobRecord) -> Path:
-    result_file = _result_path_for_read(rec.job_id, rec.date)
-    if not result_file.exists():
-        raise HTTPException(status_code=410, detail="Sonuç dosyası silinmiş")
-    return result_file
+def _result_redis_key(job_id: str) -> str:
+    _validate_job_id(job_id)
+    return f"result:{job_id}"
 
 # ---------------------------------------------------------------------------
 # Redis helpers
@@ -224,6 +222,50 @@ async def _get_job_from_redis(job_id: str) -> JobRecord | None:
         return JobRecord.from_dict(json.loads(data))
     except (json.JSONDecodeError, TypeError, KeyError):
         return None
+
+
+async def _save_result_to_redis(job_id: str, result_text: str) -> None:
+    await _redis.set(_result_redis_key(job_id), result_text, ex=_REDIS_TTL)
+
+
+async def _get_result_from_redis(job_id: str) -> str | None:
+    return await _redis.get(_result_redis_key(job_id))
+
+
+async def _get_result_content_or_raise(rec: JobRecord) -> str | None:
+    result_text = await _get_result_from_redis(rec.job_id)
+    if result_text is not None:
+        return result_text
+
+    result_file = _result_path_for_read(rec.job_id, rec.date)
+    if not result_file.exists():
+        raise HTTPException(status_code=410, detail="Sonuç dosyası silinmiş")
+
+    try:
+        result_text = await asyncio.to_thread(result_file.read_text, encoding="utf-8")
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Sonuç dosyası okunamadı: {e}")
+
+    try:
+        await _save_result_to_redis(rec.job_id, result_text)
+    except Exception as e:
+        log.warning(f"[{rec.job_id[:8]}] Sonuç Redis cache'e yazılamadı: {e}")
+
+    return result_text
+
+
+async def _build_result_response(rec: JobRecord, inline: bool) -> Response:
+    result_text = await _get_result_content_or_raise(rec)
+    headers = {}
+    if inline:
+        headers["Content-Disposition"] = "inline"
+    else:
+        headers["Content-Disposition"] = f'attachment; filename="{rec.job_id}.json"'
+    return Response(
+        content=result_text,
+        media_type="application/json; charset=utf-8",
+        headers=headers,
+    )
 
 # ---------------------------------------------------------------------------
 # Disk persistence helpers (backup — Redis primary source of truth)
@@ -278,13 +320,25 @@ async def _load_todays_index():
                     continue
                 count += 1
                 if rec.status == "pending":
-                    # Disk'te sonuç dosyası varsa Redis'i güncelle, tekrar poll'a gerek yok
+                    # Sonuç Redis veya disk backup'ta varsa Redis'i güncelle, tekrar poll'a gerek yok
                     try:
+                        result_text = await _get_result_from_redis(rec.job_id)
+                        if result_text is not None:
+                            data = json.loads(result_text)
+                            rec.status = "ok"
+                            rec.result_count = len(data)
+                            await _save_job_to_redis(rec)
+                            log.info(f"[{rec.job_id[:8]}] Redis'ten recover edildi ({rec.result_count} kayıt)")
+                            continue
                         result_file = _result_path_for_read(rec.job_id, rec.date)
                         if result_file.exists():
                             data = json.loads(result_file.read_text(encoding="utf-8"))
                             rec.status = "ok"
                             rec.result_count = len(data)
+                            await _save_result_to_redis(
+                                rec.job_id,
+                                json.dumps(data, ensure_ascii=False, indent=2),
+                            )
                             await _save_job_to_redis(rec)
                             log.info(f"[{rec.job_id[:8]}] Disk'ten recover edildi ({rec.result_count} kayıt)")
                             continue
@@ -389,15 +443,12 @@ async def _daily_cleanup():
 # Background polling
 # ---------------------------------------------------------------------------
 
-def _write_result_sync(job_id: str, job_date: str, json_data: list[dict]) -> None:
+def _write_result_sync(job_id: str, job_date: str, result_text: str) -> None:
     """JSON sonucu diske atomik olarak yaz (senkron, thread'de çağrılır)."""
     result_path = _result_path_for_write(job_id, job_date)
     tmp = result_path.parent / f"{result_path.name}.tmp"
     try:
-        tmp.write_text(
-            json.dumps(json_data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        tmp.write_text(result_text, encoding="utf-8")
         os.replace(tmp, result_path)
     except Exception:
         try:
@@ -454,21 +505,26 @@ async def _poll_and_finalize(rec: JobRecord):
                         json_data: list[dict] = []
                     else:
                         json_data = _parse_csv(csv_text)
+                    result_text = json.dumps(json_data, ensure_ascii=False, indent=2)
 
-                    # JSON'ı diske yaz (thread'de, event loop bloklanmaz)
                     try:
-                        await asyncio.to_thread(
-                            _write_result_sync, rec.job_id, rec.date, json_data
-                        )
-                    except (OSError, ValueError) as e:
+                        await _save_result_to_redis(rec.job_id, result_text)
+                    except Exception as e:
                         rec.status = "failed"
-                        rec.error = f"Sonuç dosyası yazılamadı: {e}"
+                        rec.error = f"Sonuç Redis'e yazılamadı: {e}"
                         await _save_job_to_redis(rec)
                         await _save_index(rec.date)
-                        log.error(f"[{rec.job_id[:8]}] Diske yazma hatası: {e}")
+                        log.error(f"[{rec.job_id[:8]}] Redis sonuç yazılamadı: {e}")
                         return
 
-                    # Önce veriyi set et, sonra status'u "ok" yap
+                    # Disk backup; yazılamazsa sonuç yine Redis'ten servis edilir
+                    try:
+                        await asyncio.to_thread(
+                            _write_result_sync, rec.job_id, rec.date, result_text
+                        )
+                    except (OSError, ValueError) as e:
+                        log.warning(f"[{rec.job_id[:8]}] Disk backup yazılamadı: {e}")
+
                     rec.result_count = len(json_data)
                     rec.status = "ok"
                     await _save_job_to_redis(rec)
@@ -769,13 +825,7 @@ async def get_result(job_id: str):
     if rec.status == "failed":
         raise HTTPException(status_code=422, detail=f"Job başarısız: {rec.error}")
 
-    result_file = _get_result_file_or_raise(rec)
-
-    return FileResponse(
-        path=str(result_file),
-        media_type="application/json; charset=utf-8",
-        filename=f"{rec.job_id}.json",
-    )
+    return await _build_result_response(rec, inline=False)
 
 
 @app.get("/api/jobs/{job_id}/result/json")
@@ -798,9 +848,4 @@ async def get_result_json(job_id: str):
     if rec.status == "failed":
         raise HTTPException(status_code=422, detail=f"Job başarısız: {rec.error}")
 
-    result_file = _get_result_file_or_raise(rec)
-    return FileResponse(
-        path=str(result_file),
-        media_type="application/json; charset=utf-8",
-        headers={"Content-Disposition": "inline"},
-    )
+    return await _build_result_response(rec, inline=True)
