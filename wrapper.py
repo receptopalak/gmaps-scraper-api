@@ -39,7 +39,6 @@ log = logging.getLogger("wrapper")
 
 GOSOM_API_URL = os.environ.get("GOSOM_API_URL", "http://localhost:8080/api/v1")
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", "gmapsdata/json")).resolve()
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 MAX_POLLS = 720          # ~36 dk (ortalama 3sn aralıkla)
 
 # job_id doğrulama: kesin UUID formatı
@@ -52,6 +51,20 @@ _DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Redis TTL: 48 saat
 _REDIS_TTL = 172800
+
+
+def _build_redis_url() -> str:
+    redis_url = os.environ.get("REDIS_URL")
+    if redis_url:
+        return redis_url
+
+    redis_host = os.environ.get("REDIS_HOST", "localhost")
+    redis_port = os.environ.get("REDIS_PORT", "6379")
+    redis_db = os.environ.get("REDIS_DB", "0")
+    return f"redis://{redis_host}:{redis_port}/{redis_db}"
+
+
+REDIS_URL = _build_redis_url()
 
 # ---------------------------------------------------------------------------
 # Value / CSV helpers  (mevcut – değişiklik yok)

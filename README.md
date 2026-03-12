@@ -31,6 +31,16 @@ This starts two services:
 - **Gosom scraper** on port `8085`
 - **Wrapper API** on port `8003`
 
+For Redis, the wrapper reads `REDIS_URL` first. If that is not set, it falls back to `REDIS_HOST`, `REDIS_PORT`, and `REDIS_DB`.
+
+Example Kubernetes setting:
+
+```yaml
+env:
+  - name: REDIS_URL
+    value: redis://redis:6379/0
+```
+
 ## API Reference
 
 ### Create a Job
