@@ -68,7 +68,7 @@ curl -X POST http://localhost:8003/api/jobs \
 | `max_reviews` | int | 10 | 0-500 | Maximum reviews per place |
 
 **Deduplication:** If the same query (case-insensitive) with the same parameters was already submitted today:
-- Completed job → returns `200` with `download_url` (no new scraping)
+- Completed job → returns `200` with `download_url` and `result_url` (no new scraping)
 - Pending job → returns `200` with `status: "pending"` (no duplicate job)
 - Failed job → creates a new job (retry)
 
@@ -86,7 +86,8 @@ curl http://localhost:8003/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48
   "status": "ok",
   "created_at": "2026-03-09T14:28:36.061990",
   "result_count": 20,
-  "download_url": "/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48/result"
+  "download_url": "/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48/result",
+  "result_url": "/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48/result/json"
 }
 ```
 
@@ -103,6 +104,14 @@ curl http://localhost:8003/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48
 ```bash
 curl http://localhost:8003/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48/result
 ```
+
+### Get Results Inline
+
+```bash
+curl http://localhost:8003/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48/result/json
+```
+
+Returns the same JSON payload inline, without forcing a file download.
 
 Returns a JSON array of place objects. Each object includes:
 

@@ -180,6 +180,20 @@ def _result_path_for_read(job_id: str, job_date: str) -> Path:
         raise ValueError(f"Geçersiz yol: {p}")
     return p
 
+
+def _job_result_urls(job_id: str) -> dict[str, str]:
+    return {
+        "download_url": f"/api/jobs/{job_id}/result",
+        "result_url": f"/api/jobs/{job_id}/result/json",
+    }
+
+
+def _get_result_file_or_raise(rec: JobRecord) -> Path:
+    result_file = _result_path_for_read(rec.job_id, rec.date)
+    if not result_file.exists():
+        raise HTTPException(status_code=410, detail="Sonuç dosyası silinmiş")
+    return result_file
+
 # ---------------------------------------------------------------------------
 # Redis helpers
 # ---------------------------------------------------------------------------
@@ -572,7 +586,7 @@ async def create_job(body: dict):
                         "job_id": existing.job_id,
                         "status": "ok",
                         "result_count": existing.result_count,
-                        "download_url": f"/api/jobs/{existing.job_id}/result",
+                        **_job_result_urls(existing.job_id),
                     },
                     status_code=200,
                 )
@@ -696,7 +710,7 @@ async def list_jobs():
         }
         if rec.status == "ok":
             item["result_count"] = rec.result_count
-            item["download_url"] = f"/api/jobs/{rec.job_id}/result"
+            item.update(_job_result_urls(rec.job_id))
         elif rec.status == "failed":
             item["error"] = rec.error
         jobs.append(item)
@@ -725,7 +739,7 @@ async def get_job(job_id: str):
     }
     if rec.status == "ok":
         resp["result_count"] = rec.result_count
-        resp["download_url"] = f"/api/jobs/{rec.job_id}/result"
+        resp.update(_job_result_urls(rec.job_id))
     elif rec.status == "failed":
         resp["error"] = rec.error
 
@@ -755,12 +769,38 @@ async def get_result(job_id: str):
     if rec.status == "failed":
         raise HTTPException(status_code=422, detail=f"Job başarısız: {rec.error}")
 
-    result_file = _result_path_for_read(rec.job_id, rec.date)
-    if not result_file.exists():
-        raise HTTPException(status_code=410, detail="Sonuç dosyası silinmiş")
+    result_file = _get_result_file_or_raise(rec)
 
     return FileResponse(
         path=str(result_file),
         media_type="application/json; charset=utf-8",
         filename=f"{rec.job_id}.json",
+    )
+
+
+@app.get("/api/jobs/{job_id}/result/json")
+async def get_result_json(job_id: str):
+    try:
+        _validate_job_id(job_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Geçersiz job_id formatı")
+
+    rec = await _get_job_from_redis(job_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Job bulunamadı")
+
+    if rec.status == "pending":
+        return UTF8JSONResponse(
+            content={"status": "pending", "message": "Job henüz tamamlanmadı"},
+            status_code=202,
+        )
+
+    if rec.status == "failed":
+        raise HTTPException(status_code=422, detail=f"Job başarısız: {rec.error}")
+
+    result_file = _get_result_file_or_raise(rec)
+    return FileResponse(
+        path=str(result_file),
+        media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": "inline"},
     )
