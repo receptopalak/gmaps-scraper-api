@@ -182,7 +182,15 @@ Amaç:
 {
   "query": "restaurants istanbul",
   "depth": 1,
-  "max_reviews": 10
+  "max_reviews": 10,
+  "extra_reviews": false,
+  "place_id": null,
+  "lang": "tr",
+  "geo": null,
+  "zoom": null,
+  "radius": null,
+  "email": false,
+  "fast_mode": false
 }
 ```
 
@@ -190,9 +198,17 @@ Amaç:
 
 | Alan | Tip | Zorunlu | Varsayılan | Geçerli Aralık | Açıklama |
 |---|---|---|---|---|---|
-| `query` | string | Evet | Yok | Boş olamaz | Google Maps arama sorgusu |
+| `query` | string | Evet | Yok | Boş olamaz | Google Maps arama sorgusu. `place_id` kullanıyorsan ilgili yerin adını burada da göndermelisin |
 | `depth` | integer | Hayır | `1` | `1-10` | Kaç seviye/kaç sayfa derine gidileceği |
 | `max_reviews` | integer | Hayır | `10` | `0-500` | Her işletme için maksimum review sayısı |
+| `extra_reviews` | boolean | Hayır | `false` | `true/false` | Gosom'un geniş review toplama modunu denemek için |
+| `place_id` | string | Hayır | `null` | string | Deneysel: Google Maps place ID ile arama denemesi. Tek başına kullanılmaz, ilgili yerin adı `query` içinde de verilmelidir |
+| `lang` | string | Hayır | `tr` | örn: `tr`, `en`, `de` | Sonuç dili |
+| `geo` | string | Hayır | `null` | `lat,lng` | Aramayı belirli koordinata göre yönlendirme |
+| `zoom` | integer | Hayır | `null` | `0-21` | Harita zoom seviyesi |
+| `radius` | number | Hayır | `null` | `> 0` | Arama yarıçapı, metre cinsinden |
+| `email` | boolean | Hayır | `false` | `true/false` | İşletme websitesinden email toplamayı dener |
+| `fast_mode` | boolean | Hayır | `false` | `true/false` | Daha hızlı ama daha az detaylı scraping denemesi |
 
 ### `query` İçin Ne Yazılır
 
@@ -245,6 +261,154 @@ Her işletme için toplanacak review sayısını sınırlar.
 - `50`: orta seviye veri
 - `100+`: daha ağır iş yükü
 
+Not:
+
+- `max_reviews` üst sınırdır, garanti edilen sayı değildir
+- Google Maps tarafında görünürlük, scraping davranışı ve provider limitleri nedeniyle daha az review dönebilir
+- Daha fazla review için `extra_reviews: true` denemelisin
+
+### `extra_reviews` Ne İşe Yarar
+
+Bu alan `true` olduğunda Gosom'un geniş review toplama modunu açmayı dener.
+
+Örnek:
+
+```json
+{
+  "query": "restaurants istanbul",
+  "depth": 1,
+  "max_reviews": 15,
+  "extra_reviews": true
+}
+```
+
+Beklenti:
+
+- Review sayısı artabilir
+- Ama yine de `15` garanti edilmez
+- Bu alan upstream davranışına bağlıdır
+
+### `place_id` Ne İşe Yarar
+
+Bu alan deneysel olarak place ID üzerinden job oluşturmayı dener.
+
+Örnek:
+
+```json
+{
+  "place_id": "ChIJN1t_tDeuEmsRUsoyG83frY4",
+  "query": "Google Sydney",
+  "depth": 1,
+  "max_reviews": 20,
+  "extra_reviews": true
+}
+```
+
+Not:
+
+- Bu özellik Gosom tarafında resmi olarak dokümante edilmiş değildir
+- `place_id` gönderiyorsan aynı istekte ilgili yerin adını `query` içinde de göndermelisin
+- Wrapper, place ID'den Google Maps URL üretip upstream'e keyword olarak gönderir
+- Çalışırsa kalır, güvenilmez davranırsa kaldırılmalıdır
+
+### `lang` Ne İşe Yarar
+
+Arama ve veri toplama dilini belirler.
+
+Örnek:
+
+```json
+{
+  "query": "restaurants istanbul",
+  "lang": "en"
+}
+```
+
+Kullanım örnekleri:
+
+- `tr`
+- `en`
+- `de`
+
+### `geo` Ne İşe Yarar
+
+Aramayı belirli koordinata yakınlaştırmak için kullanılır.
+
+Format:
+
+```text
+lat,lng
+```
+
+Örnek:
+
+```json
+{
+  "query": "restaurants",
+  "geo": "41.0082,28.9784"
+}
+```
+
+### `zoom` Ne İşe Yarar
+
+Harita zoom seviyesini belirler.
+
+- minimum: `0`
+- maksimum: `21`
+
+Örnek:
+
+```json
+{
+  "query": "cafes istanbul",
+  "zoom": 14
+}
+```
+
+### `radius` Ne İşe Yarar
+
+Arama yarıçapını metre cinsinden belirler.
+
+Örnek:
+
+```json
+{
+  "query": "dentist ankara",
+  "radius": 2500
+}
+```
+
+### `email` Ne İşe Yarar
+
+İşletmenin websitesi üzerinden email adresi toplamayı dener.
+
+Örnek:
+
+```json
+{
+  "query": "lawyer istanbul",
+  "email": true
+}
+```
+
+Not:
+
+- Email her işletmede bulunmaz
+- Website olmayan kayıtlarda doğal olarak boş dönebilir
+
+### `fast_mode` Ne İşe Yarar
+
+Upstream scraper'ın daha hızlı ama daha düşük detaylı çalışma modunu dener.
+
+Örnek:
+
+```json
+{
+  "query": "bakery istanbul",
+  "fast_mode": true
+}
+```
+
 ### Başarılı Yeni Job Cevabı
 
 HTTP `201`
@@ -281,6 +445,8 @@ HTTP `200`
 ```json
 {
   "job_id": "97c9ed6c-7e52-4c74-aa34-d18a16b9dd48",
+  "query": "restaurants istanbul",
+  "place_id": null,
   "status": "pending"
 }
 ```
@@ -325,8 +491,16 @@ curl "$BASE_URL/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48"
 {
   "job_id": "97c9ed6c-7e52-4c74-aa34-d18a16b9dd48",
   "query": "restaurants istanbul",
+  "place_id": null,
   "status": "pending",
-  "created_at": "2026-03-09T14:28:36.061990"
+  "created_at": "2026-03-09T14:28:36.061990",
+  "extra_reviews": false,
+  "lang": "tr",
+  "geo": null,
+  "zoom": null,
+  "radius": null,
+  "email": false,
+  "fast_mode": false
 }
 ```
 
@@ -336,8 +510,16 @@ curl "$BASE_URL/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48"
 {
   "job_id": "97c9ed6c-7e52-4c74-aa34-d18a16b9dd48",
   "query": "restaurants istanbul",
+  "place_id": null,
   "status": "ok",
   "created_at": "2026-03-09T14:28:36.061990",
+  "extra_reviews": true,
+  "lang": "tr",
+  "geo": "41.0082,28.9784",
+  "zoom": 14,
+  "radius": 2500,
+  "email": true,
+  "fast_mode": false,
   "result_count": 20,
   "download_url": "/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48/result",
   "result_url": "/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48/result/json"
@@ -350,8 +532,16 @@ curl "$BASE_URL/api/jobs/97c9ed6c-7e52-4c74-aa34-d18a16b9dd48"
 {
   "job_id": "97c9ed6c-7e52-4c74-aa34-d18a16b9dd48",
   "query": "restaurants istanbul",
+  "place_id": null,
   "status": "failed",
   "created_at": "2026-03-09T14:28:36.061990",
+  "extra_reviews": false,
+  "lang": "tr",
+  "geo": null,
+  "zoom": null,
+  "radius": null,
+  "email": false,
+  "fast_mode": false,
   "error": "CSV indirme hatası: timeout"
 }
 ```
@@ -554,6 +744,14 @@ villamore trabzon
 | `download_url` | Sadece `ok` durumunda | Dosya gibi sonuç alma endpoint'i |
 | `result_url` | Sadece `ok` durumunda | Direkt JSON alma endpoint'i |
 | `error` | Sadece `failed` durumunda | Hata detayı |
+| `extra_reviews` | Job response'larında | Geniş review modu açık mı |
+| `place_id` | Job response'larında | Deneysel place ID değeri |
+| `lang` | Job response'larında | Kullanılan dil |
+| `geo` | Job response'larında | Kullanılan koordinat |
+| `zoom` | Job response'larında | Kullanılan zoom |
+| `radius` | Job response'larında | Kullanılan radius |
+| `email` | Job response'larında | Email toplama denendi mi |
+| `fast_mode` | Job response'larında | Hızlı mod açık mı |
 
 ## Job Durumları
 
@@ -864,7 +1062,18 @@ BASE_URL=https://scraper.geolocalrank.com
 # 1. Job oluştur
 JOB_ID=$(curl -s -X POST "$BASE_URL/api/jobs" \
   -H 'Content-Type: application/json' \
-  -d '{"query":"restaurants istanbul","depth":1,"max_reviews":10}' | python -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
+  -d '{
+    "query":"restaurants istanbul",
+    "depth":1,
+    "max_reviews":15,
+    "extra_reviews":true,
+    "lang":"tr",
+    "geo":"41.0082,28.9784",
+    "zoom":14,
+    "radius":2500,
+    "email":true,
+    "fast_mode":false
+  }' | python -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
 
 echo "JOB_ID=$JOB_ID"
 

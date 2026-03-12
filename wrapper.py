@@ -12,6 +12,7 @@ import shutil
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote_plus
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response
@@ -99,10 +100,27 @@ def _parse_csv(text: str) -> list[dict]:
 # Cache key
 # ---------------------------------------------------------------------------
 
-def _cache_key_hash(query: str, depth: int, max_reviews: int) -> str:
+def _cache_key_hash(
+    query: str,
+    depth: int,
+    max_reviews: int,
+    extra_reviews: bool = False,
+    place_id: str | None = None,
+    lang: str = "tr",
+    geo: str | None = None,
+    zoom: int | None = None,
+    radius: float | None = None,
+    email: bool = False,
+    fast_mode: bool = False,
+) -> str:
     """Dedup için deterministic hash."""
     today = date.today().isoformat()
-    raw = f"{query.strip().lower()}:{depth}:{max_reviews}:{today}"
+    raw = (
+        f"{query.strip().lower()}:{depth}:{max_reviews}:{int(extra_reviews)}:"
+        f"{(place_id or '').strip().lower()}:{lang.strip().lower()}:"
+        f"{(geo or '').strip().lower()}:{zoom if zoom is not None else ''}:"
+        f"{radius if radius is not None else ''}:{int(email)}:{int(fast_mode)}:{today}"
+    )
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 # ---------------------------------------------------------------------------
@@ -120,6 +138,14 @@ class JobRecord:
     date: str             # "YYYY-MM-DD"
     result_count: int | None = None
     error: str | None = None
+    extra_reviews: bool = False
+    place_id: str | None = None
+    lang: str = "tr"
+    geo: str | None = None
+    zoom: int | None = None
+    radius: float | None = None
+    email: bool = False
+    fast_mode: bool = False
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -143,6 +169,47 @@ def _validate_job_id(job_id: str) -> None:
     """job_id'nin UUID formatında olduğunu doğrula (path traversal koruması)."""
     if not _VALID_JOB_ID.match(job_id):
         raise ValueError(f"Geçersiz job_id formatı: {job_id}")
+
+
+def _normalize_place_id(place_id: str | None) -> str | None:
+    if place_id is None:
+        return None
+    value = str(place_id).strip()
+    if not value:
+        return None
+    if len(value) > 256:
+        raise ValueError("place_id çok uzun")
+    return value
+
+
+def _normalize_lang(lang: str | None) -> str:
+    value = str(lang or "tr").strip().lower()
+    if not value:
+        return "tr"
+    if len(value) > 12 or not re.match(r"^[a-z-]+$", value):
+        raise ValueError("lang geçersiz")
+    return value
+
+
+def _normalize_geo(geo: str | None) -> str | None:
+    if geo is None:
+        return None
+    value = str(geo).strip()
+    if not value:
+        return None
+    if not re.match(r"^-?\d+(\.\d+)?,-?\d+(\.\d+)?$", value):
+        raise ValueError("geo 'lat,lng' formatında olmalı")
+    return value
+
+
+def _build_gosom_keyword(query: str, place_id: str | None) -> str:
+    if not place_id:
+        return query
+    label = query.strip() or "Google"
+    return (
+        "https://www.google.com/maps/search/?api=1"
+        f"&query={quote_plus(label)}&query_place_id={quote_plus(place_id)}"
+    )
 
 
 def _ensure_dir_for_date(job_date: str) -> Path:
@@ -610,9 +677,21 @@ app = FastAPI(title="Google Maps Custom JSON API", lifespan=lifespan)
 
 @app.post("/api/jobs")
 async def create_job(body: dict):
-    query = body.get("query", "").strip()
-    if not query:
-        raise HTTPException(status_code=400, detail="query gerekli")
+    query = str(body.get("query", "")).strip()
+    try:
+        place_id = _normalize_place_id(body.get("place_id"))
+        lang = _normalize_lang(body.get("lang"))
+        geo = _normalize_geo(body.get("geo"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not query and not place_id:
+        raise HTTPException(status_code=400, detail="query veya place_id gerekli")
+    if place_id and not query:
+        raise HTTPException(
+            status_code=400,
+            detail="place_id kullanırken ilgili yerin adını query olarak da göndermelisin",
+        )
 
     # Parametre validasyonu
     try:
@@ -625,11 +704,50 @@ async def create_job(body: dict):
         raise HTTPException(status_code=400, detail="depth 1-10 arasında olmalı")
     if not (0 <= max_reviews <= 500):
         raise HTTPException(status_code=400, detail="max_reviews 0-500 arasında olmalı")
+    extra_reviews = bool(body.get("extra_reviews", False))
+    email = bool(body.get("email", False))
+    fast_mode = bool(body.get("fast_mode", False))
+
+    zoom_raw = body.get("zoom")
+    if zoom_raw in (None, ""):
+        zoom = None
+    else:
+        try:
+            zoom = int(zoom_raw)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="zoom tam sayı olmalı")
+        if not (0 <= zoom <= 21):
+            raise HTTPException(status_code=400, detail="zoom 0-21 arasında olmalı")
+
+    radius_raw = body.get("radius")
+    if radius_raw in (None, ""):
+        radius = None
+    else:
+        try:
+            radius = float(radius_raw)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="radius sayı olmalı")
+        if radius <= 0:
+            raise HTTPException(status_code=400, detail="radius 0'dan büyük olmalı")
 
     await _daily_cleanup()
 
     today = date.today().isoformat()
-    h = _cache_key_hash(query, depth, max_reviews)
+    effective_query = query or f"place_id:{place_id}"
+    gosom_keyword = _build_gosom_keyword(query, place_id)
+    h = _cache_key_hash(
+        effective_query,
+        depth,
+        max_reviews,
+        extra_reviews=extra_reviews,
+        place_id=place_id,
+        lang=lang,
+        geo=geo,
+        zoom=zoom,
+        radius=radius,
+        email=email,
+        fast_mode=fast_mode,
+    )
 
     # Deduplication kontrolü — Redis'ten
     existing_job_id = await _redis.get(f"qidx:{today}:{h}")
@@ -640,8 +758,17 @@ async def create_job(body: dict):
                 return UTF8JSONResponse(
                     content={
                         "job_id": existing.job_id,
+                        "query": existing.query,
+                        "place_id": existing.place_id,
                         "status": "ok",
                         "result_count": existing.result_count,
+                        "extra_reviews": existing.extra_reviews,
+                        "lang": existing.lang,
+                        "geo": existing.geo,
+                        "zoom": existing.zoom,
+                        "radius": existing.radius,
+                        "email": existing.email,
+                        "fast_mode": existing.fast_mode,
                         **_job_result_urls(existing.job_id),
                     },
                     status_code=200,
@@ -650,7 +777,16 @@ async def create_job(body: dict):
                 return UTF8JSONResponse(
                     content={
                         "job_id": existing.job_id,
+                        "query": existing.query,
+                        "place_id": existing.place_id,
                         "status": "pending",
+                        "extra_reviews": existing.extra_reviews,
+                        "lang": existing.lang,
+                        "geo": existing.geo,
+                        "zoom": existing.zoom,
+                        "radius": existing.radius,
+                        "email": existing.email,
+                        "fast_mode": existing.fast_mode,
                     },
                     status_code=200,
                 )
@@ -669,12 +805,24 @@ async def create_job(body: dict):
         # Gosom'a POST
         payload = {
             "name": f"wrapper_{datetime.now().strftime('%H%M%S')}",
-            "keywords": [query],
-            "lang": "tr",
+            "keywords": [gosom_keyword],
+            "lang": lang,
             "depth": depth,
             "max_reviews": max_reviews,
             "max_time": 3600,
         }
+        if extra_reviews:
+            payload["extra_reviews"] = True
+        if email:
+            payload["email"] = True
+        if geo:
+            payload["geo"] = geo
+        if zoom is not None:
+            payload["zoom"] = zoom
+        if radius is not None:
+            payload["radius"] = radius
+        if fast_mode:
+            payload["fast_mode"] = True
 
         try:
             async with httpx.AsyncClient(timeout=30) as client:
@@ -701,13 +849,26 @@ async def create_job(body: dict):
         except ValueError:
             raise HTTPException(status_code=502, detail=f"Gosom geçersiz job_id döndürdü: {job_id}")
 
-        log.info(f"Yeni job oluşturuldu: {job_id[:8]} query='{query}'")
+        log.info(
+            f"Yeni job oluşturuldu: {job_id[:8]} query='{effective_query}' "
+            f"place_id='{place_id}' extra_reviews={extra_reviews} "
+            f"lang={lang} geo={geo} zoom={zoom} radius={radius} "
+            f"email={email} fast_mode={fast_mode}"
+        )
 
         rec = JobRecord(
             job_id=job_id,
-            query=query,
+            query=effective_query,
             depth=depth,
             max_reviews=max_reviews,
+            extra_reviews=extra_reviews,
+            place_id=place_id,
+            lang=lang,
+            geo=geo,
+            zoom=zoom,
+            radius=radius,
+            email=email,
+            fast_mode=fast_mode,
             status="pending",
             created_at=datetime.now().isoformat(),
             date=today,
@@ -734,7 +895,19 @@ async def create_job(body: dict):
         task.add_done_callback(_active_tasks.discard)
 
         return UTF8JSONResponse(
-            content={"job_id": job_id, "status": "pending"},
+            content={
+                "job_id": job_id,
+                "query": effective_query,
+                "place_id": place_id,
+                "status": "pending",
+                "extra_reviews": extra_reviews,
+                "lang": lang,
+                "geo": geo,
+                "zoom": zoom,
+                "radius": radius,
+                "email": email,
+                "fast_mode": fast_mode,
+            },
             status_code=201,
         )
     finally:
@@ -761,8 +934,16 @@ async def list_jobs():
         item = {
             "job_id": rec.job_id,
             "query": rec.query,
+            "place_id": rec.place_id,
             "status": rec.status,
             "created_at": rec.created_at,
+            "extra_reviews": rec.extra_reviews,
+            "lang": rec.lang,
+            "geo": rec.geo,
+            "zoom": rec.zoom,
+            "radius": rec.radius,
+            "email": rec.email,
+            "fast_mode": rec.fast_mode,
         }
         if rec.status == "ok":
             item["result_count"] = rec.result_count
@@ -790,8 +971,16 @@ async def get_job(job_id: str):
     resp: dict = {
         "job_id": rec.job_id,
         "query": rec.query,
+        "place_id": rec.place_id,
         "status": rec.status,
         "created_at": rec.created_at,
+        "extra_reviews": rec.extra_reviews,
+        "lang": rec.lang,
+        "geo": rec.geo,
+        "zoom": rec.zoom,
+        "radius": rec.radius,
+        "email": rec.email,
+        "fast_mode": rec.fast_mode,
     }
     if rec.status == "ok":
         resp["result_count"] = rec.result_count
