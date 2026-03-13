@@ -1109,6 +1109,133 @@ async def _build_dashboard_page_context(job_date: str, status_filter: str) -> di
         "summary": summary,
     }
 
+
+def _guide_content(lang: str) -> dict:
+    if lang == "en":
+        return {
+            "page_lang": "en",
+            "lang": "en",
+            "title": "GeoLocalRank Usage Guide",
+            "subtitle": "How to create jobs, check status, and consume results from the scraper API.",
+            "hero_note": "This page is public documentation. The dashboard remains password-protected.",
+            "sections": [
+                {
+                    "title": "Base URLs",
+                    "items": [
+                        "Production API: https://scraper.geolocalrank.com",
+                        "Swagger UI: /docs",
+                        "OpenAPI schema: /openapi.json",
+                    ],
+                },
+                {
+                    "title": "Core flow",
+                    "items": [
+                        "Send POST /api/jobs with your search payload.",
+                        "Receive a job_id and poll GET /api/jobs/{job_id}.",
+                        "When status becomes ok, fetch GET /api/jobs/{job_id}/result/json.",
+                    ],
+                },
+                {
+                    "title": "Create job payload",
+                    "items": [
+                        "query: Search phrase such as 'restaurants istanbul'.",
+                        "depth: Integer from 1 to 10.",
+                        "max_reviews: Integer from 0 to 500.",
+                        "extra_reviews: Requests extended review collection.",
+                        "place_id: Experimental. If used, the matching place name must also be sent in query.",
+                        "lang, geo, zoom, radius, email, fast_mode: Optional upstream parameters.",
+                    ],
+                },
+                {
+                    "title": "Important status codes",
+                    "items": [
+                        "201: New job created.",
+                        "200: Existing deduplicated job returned.",
+                        "202: Job is still pending.",
+                        "422: Job failed upstream.",
+                        "410: Result file and Redis cache are both unavailable.",
+                    ],
+                },
+            ],
+            "examples": {
+                "create_title": "Create a job",
+                "create_code": """curl -X POST https://scraper.geolocalrank.com/api/jobs \\
+  -H 'Content-Type: application/json' \\
+  -d '{
+    "query": "restaurants istanbul",
+    "depth": 1,
+    "max_reviews": 15,
+    "extra_reviews": true
+  }'""",
+                "status_title": "Check job status",
+                "status_code": """curl https://scraper.geolocalrank.com/api/jobs/<job_id>""",
+                "result_title": "Fetch inline JSON result",
+                "result_code": """curl https://scraper.geolocalrank.com/api/jobs/<job_id>/result/json""",
+            },
+        }
+
+    return {
+        "page_lang": "tr",
+        "lang": "tr",
+        "title": "GeoLocalRank Kullanım Kılavuzu",
+        "subtitle": "Scraper API ile job oluşturma, durum sorgulama ve sonuç alma akışını özetler.",
+        "hero_note": "Bu sayfa public dokümantasyondur. Dashboard ise şifre ile korunur.",
+        "sections": [
+            {
+                "title": "Base URL'ler",
+                "items": [
+                    "Production API: https://scraper.geolocalrank.com",
+                    "Swagger arayüzü: /docs",
+                    "OpenAPI şeması: /openapi.json",
+                ],
+            },
+            {
+                "title": "Temel akış",
+                "items": [
+                    "POST /api/jobs ile scraping job'ı başlat.",
+                    "Dönen job_id ile GET /api/jobs/{job_id} endpoint'ini poll et.",
+                    "Durum ok olduğunda GET /api/jobs/{job_id}/result/json ile sonucu al.",
+                ],
+            },
+            {
+                "title": "Job oluşturma parametreleri",
+                "items": [
+                    "query: 'restaurants istanbul' gibi arama ifadesi.",
+                    "depth: 1 ile 10 arasında tam sayı.",
+                    "max_reviews: 0 ile 500 arasında tam sayı.",
+                    "extra_reviews: Daha geniş review toplamayı dener.",
+                    "place_id: Deneyseldir. Kullanılıyorsa ilgili yerin adı query içinde de gönderilmelidir.",
+                    "lang, geo, zoom, radius, email, fast_mode: Opsiyonel upstream parametreleri.",
+                ],
+            },
+            {
+                "title": "Önemli durum kodları",
+                "items": [
+                    "201: Yeni job oluşturuldu.",
+                    "200: Deduplicate edilmiş mevcut job döndü.",
+                    "202: Job hâlâ pending durumda.",
+                    "422: Job upstream tarafta başarısız oldu.",
+                    "410: Redis ve disk tarafında sonuç bulunamadı.",
+                ],
+            },
+        ],
+        "examples": {
+            "create_title": "Job oluşturma",
+            "create_code": """curl -X POST https://scraper.geolocalrank.com/api/jobs \\
+  -H 'Content-Type: application/json' \\
+  -d '{
+    "query": "restaurants istanbul",
+    "depth": 1,
+    "max_reviews": 15,
+    "extra_reviews": true
+  }'""",
+            "status_title": "Job durumunu kontrol et",
+            "status_code": """curl https://scraper.geolocalrank.com/api/jobs/<job_id>""",
+            "result_title": "Inline JSON sonucu al",
+            "result_code": """curl https://scraper.geolocalrank.com/api/jobs/<job_id>/result/json""",
+        },
+    }
+
 # ---------------------------------------------------------------------------
 # POST /api/jobs — Job oluştur veya cache hit dön
 # ---------------------------------------------------------------------------
@@ -1182,6 +1309,16 @@ async def get_result_json(job_id: str):
         raise HTTPException(status_code=422, detail=f"Job başarısız: {rec.error}")
 
     return await _build_result_response(rec, inline=True)
+
+
+@app.get("/guide", response_class=HTMLResponse)
+async def guide_page(request: Request, lang: str = "tr"):
+    selected_lang = "en" if str(lang).strip().lower() == "en" else "tr"
+    return _render_template(
+        request,
+        "guide.html",
+        _guide_content(selected_lang),
+    )
 
 
 @app.get("/admin/login", response_class=HTMLResponse)

@@ -79,6 +79,16 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(response.status_code, 303)
         self.assertEqual(response.headers["location"], "/admin/login")
 
+    def test_guide_page_supports_turkish_and_english(self):
+        with self._client() as client:
+            tr_response = client.get("/guide?lang=tr")
+            en_response = client.get("/guide?lang=en")
+
+        self.assertEqual(tr_response.status_code, 200)
+        self.assertEqual(en_response.status_code, 200)
+        self.assertIn("GeoLocalRank Kullanım Kılavuzu", tr_response.text)
+        self.assertIn("GeoLocalRank Usage Guide", en_response.text)
+
     def test_login_sets_httponly_session_cookie_and_opens_dashboard(self):
         dashboard_context = {
             "jobs": [],
@@ -100,6 +110,7 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(response.headers["location"], "/dashboard")
         self.assertIn("HttpOnly", response.headers["set-cookie"])
         self.assertIn("Scrape job oluştur", dashboard.text)
+        self.assertIn("GeoLocalRank Kullanım Kılavuzu", dashboard.text)
         self.assertNotIn("supersecret", dashboard.text)
 
     def test_dashboard_create_job_requires_valid_csrf_and_uses_internal_service(self):

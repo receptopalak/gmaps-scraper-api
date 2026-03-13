@@ -95,6 +95,19 @@ https://scraper.geolocalrank.com/openapi.json
 
 Swagger arayüzü endpoint’leri denemek için faydalıdır, ama gerçek entegrasyon için aşağıdaki örnekler daha nettir.
 
+Kısa kullanım kılavuzu sayfası:
+
+```text
+https://scraper.geolocalrank.com/guide
+```
+
+Dil seçimi query param ile yapılır:
+
+```text
+https://scraper.geolocalrank.com/guide?lang=tr
+https://scraper.geolocalrank.com/guide?lang=en
+```
+
 ## Hızlı Başlangıç
 
 En kısa kullanım akışı:

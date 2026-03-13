@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+<section class="panel panel-accent guide-hero">
+  <div class="guide-head">
+    <div>
+      <div class="eyebrow">{% if lang == "en" %}Documentation{% else %}Dokümantasyon{% endif %}</div>
+      <h1>{{ title }}</h1>
+      <p class="lead">{{ subtitle }}</p>
+    </div>
+    <div class="language-switch">
+      <a href="/guide?lang=tr" class="{% if lang == 'tr' %}active{% endif %}">TR</a>
+      <a href="/guide?lang=en" class="{% if lang == 'en' %}active{% endif %}">EN</a>
+    </div>
+  </div>
+  <div class="alert note">{{ hero_note }}</div>
+</section>
+
+<section class="guide-grid">
+  {% for section in sections %}
+  <article class="panel">
+    <h2>{{ section["title"] }}</h2>
+    <ul class="guide-list">
+      {% for item in section["items"] %}
+      <li>{{ item }}</li>
+      {% endfor %}
+    </ul>
+  </article>
+  {% endfor %}
+</section>
+
+<section class="guide-grid single">
+  <article class="panel">
+    <h2>{{ examples.create_title }}</h2>
+    <pre class="json-preview">{{ examples.create_code }}</pre>
+  </article>
+  <article class="panel">
+    <h2>{{ examples.status_title }}</h2>
+    <pre class="json-preview">{{ examples.status_code }}</pre>
+  </article>
+  <article class="panel">
+    <h2>{{ examples.result_title }}</h2>
+    <pre class="json-preview">{{ examples.result_code }}</pre>
+  </article>
+</section>
+{% endblock %}

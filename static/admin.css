@@ -85,6 +85,24 @@ button:hover {
   color: var(--text);
 }
 
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+}
+
+.guide-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 0.7rem 1rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.66);
+  color: var(--text);
+  font-weight: 700;
+}
+
 .subhead,
 small,
 .eyebrow,
@@ -329,9 +347,64 @@ td small {
   margin: 0;
 }
 
+.guide-hero {
+  display: grid;
+  gap: 1rem;
+}
+
+.guide-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 1rem;
+}
+
+.language-switch {
+  display: inline-flex;
+  gap: 0.45rem;
+  padding: 0.35rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid var(--line);
+}
+
+.language-switch a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 52px;
+  min-height: 38px;
+  border-radius: 999px;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.language-switch a.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.guide-grid {
+  display: grid;
+  gap: 1.5rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.guide-grid.single {
+  grid-template-columns: 1fr;
+}
+
+.guide-list {
+  margin: 0;
+  padding-left: 1.1rem;
+  display: grid;
+  gap: 0.7rem;
+}
+
 @media (max-width: 960px) {
   .hero-grid,
-  .detail-grid {
+  .detail-grid,
+  .guide-grid {
     grid-template-columns: 1fr;
   }
 
@@ -346,7 +419,8 @@ td small {
   }
 
   .topbar,
-  .section-head {
+  .section-head,
+  .guide-head {
     align-items: start;
     flex-direction: column;
   }

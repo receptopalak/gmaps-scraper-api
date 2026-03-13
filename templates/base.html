@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="tr">
+<html lang="{{ page_lang or 'tr' }}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -11,14 +11,16 @@
     <header class="topbar">
       <div>
         <a class="brand" href="/dashboard">GeoLocalRank Scraper</a>
-        <p class="subhead">Tek kullanıcılı, server-rendered operasyon paneli</p>
       </div>
-      {% if csrf_token %}
-      <form action="/admin/logout" method="post" class="inline-form">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button type="submit" class="ghost-button">Çıkış</button>
-      </form>
-      {% endif %}
+      <div class="topbar-actions">
+        <a class="guide-link" href="/guide">GeoLocalRank Kullanım Kılavuzu</a>
+        {% if csrf_token %}
+        <form action="/admin/logout" method="post" class="inline-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="ghost-button">Çıkış</button>
+        </form>
+        {% endif %}
+      </div>
     </header>
     <main class="content">
       {% block content %}{% endblock %}
