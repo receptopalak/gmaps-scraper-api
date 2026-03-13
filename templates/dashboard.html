@@ -1,0 +1,186 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard{% endblock %}
+
+{% block content %}
+<section class="hero-grid">
+  <article class="panel panel-accent">
+    <div class="eyebrow">Yeni sorgu</div>
+    <h1>Scrape job oluştur</h1>
+    <p class="lead">Form server-side işlenir. Dashboard, public API’yi browser’dan token ile çağırmaz; aynı uygulama içindeki servis fonksiyonlarını kullanır.</p>
+
+    {% if error %}
+    <div class="alert error">{{ error }}</div>
+    {% endif %}
+
+    {% if success %}
+    <div class="alert success">
+      Job oluşturuldu veya mevcut job döndü:
+      <a href="/dashboard/jobs/{{ success }}">{{ success }}</a>
+    </div>
+    {% endif %}
+
+    <form action="/dashboard/jobs" method="post" class="job-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+      <label class="full">
+        <span>query</span>
+        <input type="text" name="query" value="{{ form_values.query }}" placeholder="restaurants istanbul" required>
+      </label>
+
+      <label class="full">
+        <span>place_id</span>
+        <input type="text" name="place_id" value="{{ form_values.place_id }}" placeholder="Opsiyonel. Varsa ilgili yerin adı query içinde de olmalı.">
+      </label>
+
+      <label>
+        <span>depth</span>
+        <input type="number" name="depth" min="1" max="10" value="{{ form_values.depth }}">
+      </label>
+
+      <label>
+        <span>max_reviews</span>
+        <input type="number" name="max_reviews" min="0" max="500" value="{{ form_values.max_reviews }}">
+      </label>
+
+      <label>
+        <span>lang</span>
+        <input type="text" name="lang" value="{{ form_values.lang }}" placeholder="tr">
+      </label>
+
+      <label>
+        <span>geo</span>
+        <input type="text" name="geo" value="{{ form_values.geo }}" placeholder="41.0082,28.9784">
+      </label>
+
+      <label>
+        <span>zoom</span>
+        <input type="number" name="zoom" min="0" max="21" value="{{ form_values.zoom }}">
+      </label>
+
+      <label>
+        <span>radius</span>
+        <input type="number" step="any" min="0" name="radius" value="{{ form_values.radius }}" placeholder="2500">
+      </label>
+
+      <label class="checkbox">
+        <input type="checkbox" name="extra_reviews" {% if form_values.extra_reviews %}checked{% endif %}>
+        <span>extra_reviews</span>
+      </label>
+
+      <label class="checkbox">
+        <input type="checkbox" name="email" {% if form_values.email %}checked{% endif %}>
+        <span>email</span>
+      </label>
+
+      <label class="checkbox">
+        <input type="checkbox" name="fast_mode" {% if form_values.fast_mode %}checked{% endif %}>
+        <span>fast_mode</span>
+      </label>
+
+      <button type="submit" class="full">Job oluştur</button>
+    </form>
+  </article>
+
+  <aside class="stats-grid">
+    <article class="stat-card">
+      <span>Toplam</span>
+      <strong>{{ summary.total }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Pending</span>
+      <strong>{{ summary.pending }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Başarılı</span>
+      <strong>{{ summary.ok }}</strong>
+    </article>
+    <article class="stat-card">
+      <span>Hatalı</span>
+      <strong>{{ summary.failed }}</strong>
+    </article>
+  </aside>
+</section>
+
+<section class="panel">
+  <div class="section-head">
+    <div>
+      <div class="eyebrow">Operasyon</div>
+      <h2>Job listesi</h2>
+    </div>
+    <form action="/dashboard" method="get" class="filters">
+      <label>
+        <span>Tarih</span>
+        <input type="date" name="job_date" value="{{ job_date }}">
+      </label>
+      <label>
+        <span>Durum</span>
+        <select name="status">
+          <option value="all" {% if status_filter == "all" %}selected{% endif %}>Tümü</option>
+          <option value="pending" {% if status_filter == "pending" %}selected{% endif %}>Pending</option>
+          <option value="ok" {% if status_filter == "ok" %}selected{% endif %}>Başarılı</option>
+          <option value="failed" {% if status_filter == "failed" %}selected{% endif %}>Hatalı</option>
+        </select>
+      </label>
+      <button type="submit">Filtrele</button>
+    </form>
+  </div>
+
+  {% if jobs %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Job</th>
+          <th>Sorgu</th>
+          <th>Durum</th>
+          <th>Parametreler</th>
+          <th>İşlemler</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for job in jobs %}
+        <tr>
+          <td>
+            <a href="/dashboard/jobs/{{ job.job_id }}">{{ job.job_id[:8] }}</a>
+            <small>{{ job.created_at }}</small>
+          </td>
+          <td>
+            <strong>{{ job.query }}</strong>
+            {% if job.place_id %}
+            <small>place_id: {{ job.place_id }}</small>
+            {% endif %}
+          </td>
+          <td>
+            <span class="status-chip status-{{ job.status }}">{{ job.status }}</span>
+            {% if job.result_count is defined %}
+            <small>{{ job.result_count }} kayıt</small>
+            {% endif %}
+            {% if job.error %}
+            <small>{{ job.error }}</small>
+            {% endif %}
+          </td>
+          <td>
+            <small>lang={{ job.lang }} depth={{ job.depth if job.depth is defined else "-" }}</small>
+            <small>geo={{ job.geo or "-" }} zoom={{ job.zoom if job.zoom is not none else "-" }}</small>
+            <small>radius={{ job.radius if job.radius is not none else "-" }} email={{ job.email }}</small>
+          </td>
+          <td class="actions">
+            <a href="/api/jobs/{{ job.job_id }}">API</a>
+            {% if job.result_url %}
+            <a href="{{ job.result_url }}">JSON</a>
+            {% endif %}
+            {% if job.download_url %}
+            <a href="{{ job.download_url }}">İndir</a>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty-state">Seçili filtre için job bulunamadı.</p>
+  {% endif %}
+</section>
+{% endblock %}

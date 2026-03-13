@@ -1,4 +1,7 @@
+argon2-cffi
 fastapi
-uvicorn[standard]
 httpx
+jinja2
+python-multipart
 redis[hiredis]
+uvicorn[standard]

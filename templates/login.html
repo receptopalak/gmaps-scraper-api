@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard Login{% endblock %}
+
+{% block content %}
+<section class="panel login-panel">
+  <div class="eyebrow">Admin erişimi</div>
+  <h1>Dashboard giriş ekranı</h1>
+  <p class="lead">Bu panel tek bir güçlü şifre ile korunur. Tarayıcıya sadece HttpOnly session cookie yazılır; bearer token veya API anahtarı arayüzde tutulmaz.</p>
+
+  {% if error %}
+  <div class="alert error">{{ error }}</div>
+  {% endif %}
+
+  {% if password_hint %}
+  <div class="alert note">{{ password_hint }}</div>
+  {% endif %}
+
+  <form action="/admin/login" method="post" class="stack-form">
+    <label>
+      <span>Şifre</span>
+      <input type="password" name="password" autocomplete="current-password" required autofocus>
+    </label>
+    <button type="submit">Giriş yap</button>
+  </form>
+</section>
+{% endblock %}

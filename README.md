@@ -26,6 +26,7 @@ Bu README, uygulamaya nasıl istek atacağını, hangi endpoint'in ne işe yarad
 - [Python Örnekleri](#python-örnekleri)
 - [Deduplication Davranışı](#deduplication-davranışı)
 - [Sistem Davranışı ve Limitler](#sistem-davranışı-ve-limitler)
+- [Dashboard](#dashboard)
 - [Ortam Değişkenleri](#ortam-değişkenleri)
 - [Yerel Geliştirme](#yerel-geliştirme)
 - [Dosya Yapısı](#dosya-yapısı)
@@ -985,6 +986,90 @@ Yaklaşık timeout:
 - Bir pod job'ı tamamladığında diğer pod'lar da sonucu Redis üzerinden dönebilir
 - Disk backup kaybolsa bile Redis TTL süresi boyunca sonuç servis edilmeye devam eder
 
+## Dashboard
+
+Bu uygulamanın içinde tek kullanıcılı bir admin dashboard vardır.
+
+Amaç:
+
+- Son job'ları arayüzden görmek
+- Yeni sorgu başlatmak
+- Belirli bir job'ın detayını ve preview sonucunu görmek
+- Tüm bunları browser tarafında bearer token veya API key sızdırmadan yapmak
+
+Dashboard endpoint'leri:
+
+| Method | Endpoint | Açıklama |
+|---|---|---|
+| `GET` | `/admin/login` | Giriş sayfası |
+| `POST` | `/admin/login` | Şifre ile login |
+| `POST` | `/admin/logout` | Session kapatma |
+| `GET` | `/dashboard` | Ana dashboard |
+| `POST` | `/dashboard/jobs` | Dashboard formundan job oluşturma |
+| `GET` | `/dashboard/jobs/{job_id}` | Job detay ekranı |
+
+Güvenlik modeli:
+
+- Şifre plaintext olarak kodda tutulmaz, env'den hash olarak alınır
+- Login sonrası browser'a sadece `HttpOnly` session cookie verilir
+- Cookie `SameSite=Strict` olarak set edilir
+- Production'da `Secure` cookie kullanılır
+- Dashboard form POST'larında CSRF token doğrulaması yapılır
+- Dashboard route'ları server-side render edilir; localStorage token veya frontend bearer token yoktur
+
+### Dashboard Nasıl Açılır
+
+Önce dashboard şifre hash'ini üret:
+
+```bash
+python3 - <<'PY'
+from argon2 import PasswordHasher
+print(PasswordHasher().hash("buraya-cok-guclu-bir-sifre-yaz"))
+PY
+```
+
+Sonra env'e koy:
+
+```bash
+export DASHBOARD_PASSWORD_HASH='$argon2id$v=19$m=65536,t=3,p=4$...'
+```
+
+Uygulama ayağa kalktıktan sonra:
+
+```text
+https://scraper.geolocalrank.com/admin/login
+```
+
+### Dashboard'dan Job Oluşturma
+
+Dashboard formu public API ile aynı parametreleri kabul eder:
+
+- `query`
+- `place_id`
+- `depth`
+- `max_reviews`
+- `extra_reviews`
+- `lang`
+- `geo`
+- `zoom`
+- `radius`
+- `email`
+- `fast_mode`
+
+Kurallar:
+
+- `place_id` kullanıyorsan ilgili yerin adını `query` alanında da vermelisin
+- Form submit edildiğinde browser doğrudan public API'ye token ile istek atmaz
+- Server aynı uygulama içindeki create-job servis fonksiyonunu çağırır
+
+### Deployment Notları
+
+- Dashboard'un çalışması için `templates/` ve `static/` klasörleri image içine kopyalanmalıdır
+- Login session'ları Redis'te tutulur; tüm replica'lar aynı Redis'i görmelidir
+- `DASHBOARD_PASSWORD_HASH` set edilmemişse dashboard route'ları `503` ile kapalı kalır
+- Production ingress'i HTTPS olmalıdır
+- `DASHBOARD_SECURE_COOKIES=true` production için önerilen varsayılandır
+
 ## Ortam Değişkenleri
 
 | Değişken | Varsayılan | Açıklama |
@@ -995,6 +1080,10 @@ Yaklaşık timeout:
 | `REDIS_HOST` | `localhost` | `REDIS_URL` yoksa kullanılır |
 | `REDIS_PORT` | `6379` | `REDIS_URL` yoksa kullanılır |
 | `REDIS_DB` | `0` | `REDIS_URL` yoksa kullanılır |
+| `DASHBOARD_PASSWORD_HASH` | boş | Dashboard şifre hash'i. Boşsa dashboard kapalıdır |
+| `DASHBOARD_SESSION_TTL_HOURS` | `12` | Admin session ömrü |
+| `DASHBOARD_COOKIE_NAME` | `gmaps_admin_session` | Dashboard cookie adı |
+| `DASHBOARD_SECURE_COOKIES` | `true` | Production'da `Secure` cookie davranışı |
 
 Kubernetes örneği:
 
@@ -1030,6 +1119,7 @@ Not:
 
 - Gosom ve Redis ayrıca erişilebilir olmalı
 - Environment variable'lar doğru set edilmeli
+- Dashboard kullanacaksan `DASHBOARD_PASSWORD_HASH` da set edilmelidir
 
 ## Dosya Yapısı
 
@@ -1039,6 +1129,8 @@ gmaps-scraper-api/
   Dockerfile
   docker-compose.yml
   requirements.txt
+  templates/
+  static/
   tests/
   gmapsdata/
     json/
@@ -1051,6 +1143,8 @@ Klasör anlamları:
 
 - `wrapper.py`: FastAPI uygulaması
 - `docker-compose.yml`: local orkestrasyon
+- `templates/`: dashboard HTML şablonları
+- `static/`: dashboard CSS dosyaları
 - `gmapsdata/json/YYYY-MM-DD/`: sonuçların saklandığı klasör
 - `index.json`: o günün job kayıtlarının yedeği
 

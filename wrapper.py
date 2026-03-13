@@ -8,14 +8,19 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote_plus
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, Response
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerifyMismatchError
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 import httpx
 import redis.asyncio as aioredis
 
@@ -52,6 +57,22 @@ _DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Redis TTL: 48 saat
 _REDIS_TTL = 172800
+
+DASHBOARD_PASSWORD_HASH = os.environ.get("DASHBOARD_PASSWORD_HASH", "").strip()
+DASHBOARD_SESSION_TTL_HOURS = int(os.environ.get("DASHBOARD_SESSION_TTL_HOURS", "12"))
+DASHBOARD_COOKIE_NAME = os.environ.get("DASHBOARD_COOKIE_NAME", "gmaps_admin_session")
+DASHBOARD_SECURE_COOKIES = os.environ.get("DASHBOARD_SECURE_COOKIES", "true").strip().lower() not in {
+    "0", "false", "no"
+}
+_ADMIN_SESSION_PREFIX = "admin:session:"
+_ADMIN_LOGIN_ATTEMPT_PREFIX = "admin:login:"
+_ADMIN_LOGIN_ATTEMPT_LIMIT = 10
+_ADMIN_LOGIN_ATTEMPT_WINDOW = 900
+
+_password_hasher = PasswordHasher()
+BASE_DIR = Path(__file__).resolve().parent
+TEMPLATES_DIR = BASE_DIR / "templates"
+STATIC_DIR = BASE_DIR / "static"
 
 
 def _build_redis_url() -> str:
@@ -211,6 +232,136 @@ def _build_gosom_keyword(query: str, place_id: str | None) -> str:
         f"&query={quote_plus(label)}&query_place_id={quote_plus(place_id)}"
     )
 
+
+def _bool_from_input(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _dashboard_enabled() -> bool:
+    return bool(DASHBOARD_PASSWORD_HASH)
+
+
+def _admin_session_key(session_id: str) -> str:
+    return f"{_ADMIN_SESSION_PREFIX}{session_id}"
+
+
+def _admin_login_attempt_key(remote_addr: str) -> str:
+    return f"{_ADMIN_LOGIN_ATTEMPT_PREFIX}{remote_addr}"
+
+
+def _require_dashboard_enabled() -> None:
+    if not _dashboard_enabled():
+        raise HTTPException(status_code=503, detail="Dashboard devre dışı")
+
+
+def _render_template(request: Request, template_name: str, context: dict, status_code: int = 200):
+    ctx = {
+        "request": request,
+        "dashboard_enabled": _dashboard_enabled(),
+        **context,
+    }
+    response = templates.TemplateResponse(request, template_name, ctx, status_code=status_code)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+async def _create_admin_session() -> tuple[str, dict]:
+    session_id = secrets.token_urlsafe(32)
+    session = {
+        "csrf": secrets.token_urlsafe(24),
+        "created_at": datetime.now().isoformat(),
+    }
+    ttl_seconds = max(DASHBOARD_SESSION_TTL_HOURS, 1) * 3600
+    await _redis.set(_admin_session_key(session_id), json.dumps(session), ex=ttl_seconds)
+    return session_id, session
+
+
+async def _get_admin_session(request: Request) -> tuple[str, dict] | None:
+    _require_dashboard_enabled()
+    session_id = request.cookies.get(DASHBOARD_COOKIE_NAME)
+    if not session_id:
+        return None
+    raw = await _redis.get(_admin_session_key(session_id))
+    if not raw:
+        return None
+    try:
+        return session_id, json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+async def _destroy_admin_session(session_id: str | None) -> None:
+    if not session_id:
+        return
+    await _redis.delete(_admin_session_key(session_id))
+
+
+async def _record_failed_login(remote_addr: str) -> int:
+    key = _admin_login_attempt_key(remote_addr)
+    attempts = await _redis.incr(key)
+    if attempts == 1:
+        await _redis.expire(key, _ADMIN_LOGIN_ATTEMPT_WINDOW)
+    return int(attempts)
+
+
+async def _clear_failed_logins(remote_addr: str) -> None:
+    await _redis.delete(_admin_login_attempt_key(remote_addr))
+
+
+async def _too_many_login_attempts(remote_addr: str) -> bool:
+    attempts = await _redis.get(_admin_login_attempt_key(remote_addr))
+    return int(attempts or 0) >= _ADMIN_LOGIN_ATTEMPT_LIMIT
+
+
+def _set_admin_cookie(response: Response, session_id: str) -> None:
+    response.set_cookie(
+        DASHBOARD_COOKIE_NAME,
+        session_id,
+        httponly=True,
+        secure=DASHBOARD_SECURE_COOKIES,
+        samesite="strict",
+        max_age=max(DASHBOARD_SESSION_TTL_HOURS, 1) * 3600,
+        path="/",
+    )
+
+
+def _clear_admin_cookie(response: Response) -> None:
+    response.delete_cookie(DASHBOARD_COOKIE_NAME, path="/")
+
+
+def _redirect_to_login() -> RedirectResponse:
+    response = RedirectResponse(url="/admin/login", status_code=303)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _verify_password(password: str) -> bool:
+    try:
+        return _password_hasher.verify(DASHBOARD_PASSWORD_HASH, password)
+    except (VerifyMismatchError, InvalidHashError):
+        return False
+
+
+def _remote_addr_from_request(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "").strip()
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def _validate_csrf(session: dict, csrf_token: str | None) -> None:
+    expected = str(session.get("csrf", ""))
+    provided = str(csrf_token or "")
+    if not expected or not provided or not secrets.compare_digest(expected, provided):
+        raise HTTPException(status_code=403, detail="Geçersiz CSRF token")
 
 def _ensure_dir_for_date(job_date: str) -> Path:
     """Yazma işlemleri için: klasörü oluşturarak döner."""
@@ -438,7 +589,19 @@ async def _load_todays_index():
         # Redis'e aktar
         try:
             await _save_job_to_redis(rec)
-            h = _cache_key_hash(rec.query, rec.depth, rec.max_reviews)
+            h = _cache_key_hash(
+                rec.query,
+                rec.depth,
+                rec.max_reviews,
+                extra_reviews=rec.extra_reviews,
+                place_id=rec.place_id,
+                lang=rec.lang,
+                geo=rec.geo,
+                zoom=rec.zoom,
+                radius=rec.radius,
+                email=rec.email,
+                fast_mode=rec.fast_mode,
+            )
             await _redis.set(f"qidx:{rec.date}:{h}", rec.job_id, ex=_REDIS_TTL)
         except Exception as e:
             log.warning(f"Disk→Redis aktarım hatası [{rec.job_id[:8]}]: {e}")
@@ -671,12 +834,63 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Google Maps Custom JSON API", lifespan=lifespan)
 
-# ---------------------------------------------------------------------------
-# POST /api/jobs — Job oluştur veya cache hit dön
-# ---------------------------------------------------------------------------
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-@app.post("/api/jobs")
-async def create_job(body: dict):
+
+def _job_payload(rec: JobRecord) -> dict:
+    payload = {
+        "job_id": rec.job_id,
+        "query": rec.query,
+        "place_id": rec.place_id,
+        "status": rec.status,
+        "created_at": rec.created_at,
+        "date": rec.date,
+        "depth": rec.depth,
+        "max_reviews": rec.max_reviews,
+        "extra_reviews": rec.extra_reviews,
+        "lang": rec.lang,
+        "geo": rec.geo,
+        "zoom": rec.zoom,
+        "radius": rec.radius,
+        "email": rec.email,
+        "fast_mode": rec.fast_mode,
+    }
+    if rec.status == "ok":
+        payload["result_count"] = rec.result_count
+        payload.update(_job_result_urls(rec.job_id))
+    elif rec.status == "failed":
+        payload["error"] = rec.error
+    return payload
+
+
+async def _list_jobs_data(target_date: str | None = None) -> list[dict]:
+    await _daily_cleanup()
+    date_key = target_date or date.today().isoformat()
+    job_ids = await _redis.smembers(f"jobs:date:{date_key}")
+    jobs = []
+    for jid in job_ids:
+        rec = await _get_job_from_redis(jid)
+        if not rec or rec.date != date_key:
+            continue
+        jobs.append(_job_payload(rec))
+    jobs.sort(key=lambda item: item["created_at"], reverse=True)
+    return jobs
+
+
+async def _get_job_detail_data(job_id: str) -> dict:
+    try:
+        _validate_job_id(job_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Geçersiz job_id formatı")
+
+    rec = await _get_job_from_redis(job_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Job bulunamadı")
+    return _job_payload(rec)
+
+
+async def _create_job_internal(body: dict) -> tuple[dict, int]:
     query = str(body.get("query", "")).strip()
     try:
         place_id = _normalize_place_id(body.get("place_id"))
@@ -693,7 +907,6 @@ async def create_job(body: dict):
             detail="place_id kullanırken ilgili yerin adını query olarak da göndermelisin",
         )
 
-    # Parametre validasyonu
     try:
         depth = int(body.get("depth", 1))
         max_reviews = int(body.get("max_reviews", 10))
@@ -704,9 +917,10 @@ async def create_job(body: dict):
         raise HTTPException(status_code=400, detail="depth 1-10 arasında olmalı")
     if not (0 <= max_reviews <= 500):
         raise HTTPException(status_code=400, detail="max_reviews 0-500 arasında olmalı")
-    extra_reviews = bool(body.get("extra_reviews", False))
-    email = bool(body.get("email", False))
-    fast_mode = bool(body.get("fast_mode", False))
+
+    extra_reviews = _bool_from_input(body.get("extra_reviews", False))
+    email = _bool_from_input(body.get("email", False))
+    fast_mode = _bool_from_input(body.get("fast_mode", False))
 
     zoom_raw = body.get("zoom")
     if zoom_raw in (None, ""):
@@ -749,50 +963,12 @@ async def create_job(body: dict):
         fast_mode=fast_mode,
     )
 
-    # Deduplication kontrolü — Redis'ten
     existing_job_id = await _redis.get(f"qidx:{today}:{h}")
     if existing_job_id:
         existing = await _get_job_from_redis(existing_job_id)
         if existing:
-            if existing.status == "ok":
-                return UTF8JSONResponse(
-                    content={
-                        "job_id": existing.job_id,
-                        "query": existing.query,
-                        "place_id": existing.place_id,
-                        "status": "ok",
-                        "result_count": existing.result_count,
-                        "extra_reviews": existing.extra_reviews,
-                        "lang": existing.lang,
-                        "geo": existing.geo,
-                        "zoom": existing.zoom,
-                        "radius": existing.radius,
-                        "email": existing.email,
-                        "fast_mode": existing.fast_mode,
-                        **_job_result_urls(existing.job_id),
-                    },
-                    status_code=200,
-                )
-            elif existing.status == "pending":
-                return UTF8JSONResponse(
-                    content={
-                        "job_id": existing.job_id,
-                        "query": existing.query,
-                        "place_id": existing.place_id,
-                        "status": "pending",
-                        "extra_reviews": existing.extra_reviews,
-                        "lang": existing.lang,
-                        "geo": existing.geo,
-                        "zoom": existing.zoom,
-                        "radius": existing.radius,
-                        "email": existing.email,
-                        "fast_mode": existing.fast_mode,
-                    },
-                    status_code=200,
-                )
-            # status == "failed" → yeniden dene (aşağıya devam)
+            return _job_payload(existing), 200
 
-    # Distributed lock — race condition koruması
     lock_key = f"lock:{h}"
     acquired = await _redis.set(lock_key, "1", nx=True, ex=30)
     if not acquired:
@@ -802,7 +978,6 @@ async def create_job(body: dict):
         )
 
     try:
-        # Gosom'a POST
         payload = {
             "name": f"wrapper_{datetime.now().strftime('%H%M%S')}",
             "keywords": [gosom_keyword],
@@ -843,7 +1018,6 @@ async def create_job(body: dict):
         if not job_id:
             raise HTTPException(status_code=502, detail="Gosom job id döndürmedi")
 
-        # job_id güvenlik kontrolü
         try:
             _validate_job_id(job_id)
         except ValueError:
@@ -874,8 +1048,6 @@ async def create_job(body: dict):
             date=today,
         )
 
-        # Redis'e kaydet — Gosom job zaten oluşturuldu, bu başarısız olursa
-        # job orphan kalır ama retry ile kurtarılabilir
         try:
             await _save_job_to_redis(rec)
             await _redis.set(f"qidx:{today}:{h}", job_id, ex=_REDIS_TTL)
@@ -886,35 +1058,65 @@ async def create_job(body: dict):
                 detail="Job oluşturuldu ancak kaydedilemedi, lütfen tekrar deneyin",
             )
 
-        # Disk backup
         await _save_index(rec.date)
 
-        # Background poll başlat
         task = asyncio.create_task(_poll_and_finalize(rec))
         _active_tasks.add(task)
         task.add_done_callback(_active_tasks.discard)
 
-        return UTF8JSONResponse(
-            content={
-                "job_id": job_id,
-                "query": effective_query,
-                "place_id": place_id,
-                "status": "pending",
-                "extra_reviews": extra_reviews,
-                "lang": lang,
-                "geo": geo,
-                "zoom": zoom,
-                "radius": radius,
-                "email": email,
-                "fast_mode": fast_mode,
-            },
-            status_code=201,
-        )
+        return _job_payload(rec), 201
     finally:
         try:
             await _redis.delete(lock_key)
         except Exception:
-            pass  # Lock TTL=30s ile zaten expire olacak
+            pass
+
+
+async def _get_dashboard_session_or_redirect(request: Request):
+    session_data = await _get_admin_session(request)
+    if not session_data:
+        return None, _redirect_to_login()
+    return session_data, None
+
+
+def _parse_dashboard_date(raw_value: str | None) -> str:
+    value = str(raw_value or "").strip()
+    if not value:
+        return date.today().isoformat()
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Geçersiz tarih formatı")
+
+
+async def _build_dashboard_page_context(job_date: str, status_filter: str) -> dict:
+    jobs = await _list_jobs_data(job_date)
+    allowed_filters = {"all", "pending", "ok", "failed"}
+    active_filter = status_filter if status_filter in allowed_filters else "all"
+    if active_filter != "all":
+        jobs = [job for job in jobs if job["status"] == active_filter]
+
+    summary = {
+        "total": len(jobs),
+        "pending": sum(1 for job in jobs if job["status"] == "pending"),
+        "ok": sum(1 for job in jobs if job["status"] == "ok"),
+        "failed": sum(1 for job in jobs if job["status"] == "failed"),
+    }
+    return {
+        "jobs": jobs,
+        "job_date": job_date,
+        "status_filter": active_filter,
+        "summary": summary,
+    }
+
+# ---------------------------------------------------------------------------
+# POST /api/jobs — Job oluştur veya cache hit dön
+# ---------------------------------------------------------------------------
+
+@app.post("/api/jobs")
+async def create_job(body: dict):
+    content, status_code = await _create_job_internal(body)
+    return UTF8JSONResponse(content=content, status_code=status_code)
 
 # ---------------------------------------------------------------------------
 # GET /api/jobs — Bugünün tüm job'larını listele
@@ -922,36 +1124,7 @@ async def create_job(body: dict):
 
 @app.get("/api/jobs")
 async def list_jobs():
-    await _daily_cleanup()
-    today = date.today().isoformat()
-
-    job_ids = await _redis.smembers(f"jobs:date:{today}")
-    jobs = []
-    for jid in job_ids:
-        rec = await _get_job_from_redis(jid)
-        if not rec or rec.date != today:
-            continue
-        item = {
-            "job_id": rec.job_id,
-            "query": rec.query,
-            "place_id": rec.place_id,
-            "status": rec.status,
-            "created_at": rec.created_at,
-            "extra_reviews": rec.extra_reviews,
-            "lang": rec.lang,
-            "geo": rec.geo,
-            "zoom": rec.zoom,
-            "radius": rec.radius,
-            "email": rec.email,
-            "fast_mode": rec.fast_mode,
-        }
-        if rec.status == "ok":
-            item["result_count"] = rec.result_count
-            item.update(_job_result_urls(rec.job_id))
-        elif rec.status == "failed":
-            item["error"] = rec.error
-        jobs.append(item)
-    return UTF8JSONResponse(content=jobs)
+    return UTF8JSONResponse(content=await _list_jobs_data())
 
 # ---------------------------------------------------------------------------
 # GET /api/jobs/{job_id} — Tek job durumu
@@ -959,36 +1132,7 @@ async def list_jobs():
 
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str):
-    try:
-        _validate_job_id(job_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Geçersiz job_id formatı")
-
-    rec = await _get_job_from_redis(job_id)
-    if not rec:
-        raise HTTPException(status_code=404, detail="Job bulunamadı")
-
-    resp: dict = {
-        "job_id": rec.job_id,
-        "query": rec.query,
-        "place_id": rec.place_id,
-        "status": rec.status,
-        "created_at": rec.created_at,
-        "extra_reviews": rec.extra_reviews,
-        "lang": rec.lang,
-        "geo": rec.geo,
-        "zoom": rec.zoom,
-        "radius": rec.radius,
-        "email": rec.email,
-        "fast_mode": rec.fast_mode,
-    }
-    if rec.status == "ok":
-        resp["result_count"] = rec.result_count
-        resp.update(_job_result_urls(rec.job_id))
-    elif rec.status == "failed":
-        resp["error"] = rec.error
-
-    return UTF8JSONResponse(content=resp)
+    return UTF8JSONResponse(content=await _get_job_detail_data(job_id))
 
 # ---------------------------------------------------------------------------
 # GET /api/jobs/{job_id}/result — JSON sonucu indir
@@ -1038,3 +1182,212 @@ async def get_result_json(job_id: str):
         raise HTTPException(status_code=422, detail=f"Job başarısız: {rec.error}")
 
     return await _build_result_response(rec, inline=True)
+
+
+@app.get("/admin/login", response_class=HTMLResponse)
+async def admin_login_page(request: Request):
+    _require_dashboard_enabled()
+    session_data = await _get_admin_session(request)
+    if session_data:
+        response = RedirectResponse(url="/dashboard", status_code=303)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    return _render_template(
+        request,
+        "login.html",
+        {
+            "error": None,
+            "password_hint": "Dashboard tek şifre ile korunur. Session cookie tarayıcıya HttpOnly olarak yazılır.",
+        },
+    )
+
+
+@app.post("/admin/login", response_class=HTMLResponse)
+async def admin_login(request: Request, password: str = Form(...)):
+    _require_dashboard_enabled()
+    remote_addr = _remote_addr_from_request(request)
+    if await _too_many_login_attempts(remote_addr):
+        return _render_template(
+            request,
+            "login.html",
+            {
+                "error": "Çok fazla hatalı deneme yapıldı. Biraz sonra tekrar dene.",
+                "password_hint": None,
+            },
+            status_code=429,
+        )
+
+    if not _verify_password(password):
+        await _record_failed_login(remote_addr)
+        return _render_template(
+            request,
+            "login.html",
+            {
+                "error": "Şifre hatalı.",
+                "password_hint": None,
+            },
+            status_code=401,
+        )
+
+    await _clear_failed_logins(remote_addr)
+    session_id, _session = await _create_admin_session()
+    response = RedirectResponse(url="/dashboard", status_code=303)
+    response.headers["Cache-Control"] = "no-store"
+    _set_admin_cookie(response, session_id)
+    return response
+
+
+@app.post("/admin/logout")
+async def admin_logout(request: Request, csrf_token: str = Form(...)):
+    _require_dashboard_enabled()
+    session_data, redirect = await _get_dashboard_session_or_redirect(request)
+    if redirect:
+        return redirect
+    session_id, session = session_data
+    _validate_csrf(session, csrf_token)
+    await _destroy_admin_session(session_id)
+    response = _redirect_to_login()
+    _clear_admin_cookie(response)
+    return response
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_home(request: Request, job_date: str | None = None, status: str = "all"):
+    _require_dashboard_enabled()
+    session_data, redirect = await _get_dashboard_session_or_redirect(request)
+    if redirect:
+        return redirect
+    _session_id, session = session_data
+    target_date = _parse_dashboard_date(job_date)
+    context = await _build_dashboard_page_context(target_date, status)
+    context.update(
+        {
+            "csrf_token": session["csrf"],
+            "error": None,
+            "success": request.query_params.get("created"),
+            "form_values": {
+                "query": "",
+                "place_id": "",
+                "depth": 1,
+                "max_reviews": 10,
+                "extra_reviews": False,
+                "lang": "tr",
+                "geo": "",
+                "zoom": "",
+                "radius": "",
+                "email": False,
+                "fast_mode": False,
+            },
+        }
+    )
+    return _render_template(request, "dashboard.html", context)
+
+
+@app.post("/dashboard/jobs", response_class=HTMLResponse)
+async def dashboard_create_job(
+    request: Request,
+    csrf_token: str = Form(...),
+    query: str = Form(""),
+    place_id: str = Form(""),
+    depth: str = Form("1"),
+    max_reviews: str = Form("10"),
+    extra_reviews: str | None = Form(None),
+    lang: str = Form("tr"),
+    geo: str = Form(""),
+    zoom: str = Form(""),
+    radius: str = Form(""),
+    email: str | None = Form(None),
+    fast_mode: str | None = Form(None),
+):
+    _require_dashboard_enabled()
+    session_data, redirect = await _get_dashboard_session_or_redirect(request)
+    if redirect:
+        return redirect
+    _session_id, session = session_data
+    _validate_csrf(session, csrf_token)
+
+    body = {
+        "query": query,
+        "place_id": place_id,
+        "depth": depth,
+        "max_reviews": max_reviews,
+        "extra_reviews": extra_reviews,
+        "lang": lang,
+        "geo": geo,
+        "zoom": zoom,
+        "radius": radius,
+        "email": email,
+        "fast_mode": fast_mode,
+    }
+
+    try:
+        payload, status_code = await _create_job_internal(body)
+        if status_code in {200, 201}:
+            response = RedirectResponse(url=f"/dashboard?created={payload['job_id']}", status_code=303)
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        raise HTTPException(status_code=status_code, detail="Job oluşturulamadı")
+    except HTTPException as exc:
+        target_date = date.today().isoformat()
+        context = await _build_dashboard_page_context(target_date, "all")
+        context.update(
+            {
+                "csrf_token": session["csrf"],
+                "error": exc.detail,
+                "success": None,
+                "form_values": {
+                    "query": query,
+                    "place_id": place_id,
+                    "depth": depth,
+                    "max_reviews": max_reviews,
+                    "extra_reviews": _bool_from_input(extra_reviews),
+                    "lang": lang,
+                    "geo": geo,
+                    "zoom": zoom,
+                    "radius": radius,
+                    "email": _bool_from_input(email),
+                    "fast_mode": _bool_from_input(fast_mode),
+                },
+            }
+        )
+        return _render_template(request, "dashboard.html", context, status_code=exc.status_code)
+
+
+@app.get("/dashboard/jobs/{job_id}", response_class=HTMLResponse)
+async def dashboard_job_detail(request: Request, job_id: str):
+    _require_dashboard_enabled()
+    session_data, redirect = await _get_dashboard_session_or_redirect(request)
+    if redirect:
+        return redirect
+    _session_id, session = session_data
+
+    try:
+        _validate_job_id(job_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Geçersiz job_id formatı")
+
+    rec = await _get_job_from_redis(job_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Job bulunamadı")
+
+    preview = None
+    preview_error = None
+    if rec.status == "ok":
+        try:
+            result_text = await _get_result_content_or_raise(rec)
+            preview = json.loads(result_text)[:5]
+        except HTTPException as exc:
+            preview_error = exc.detail
+        except json.JSONDecodeError:
+            preview_error = "Sonuç JSON parse edilemedi"
+
+    return _render_template(
+        request,
+        "job_detail.html",
+        {
+            "csrf_token": session["csrf"],
+            "job": _job_payload(rec),
+            "preview": preview,
+            "preview_error": preview_error,
+        },
+    )

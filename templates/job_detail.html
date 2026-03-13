@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+
+{% block title %}Job {{ job.job_id }}{% endblock %}
+
+{% block content %}
+<section class="detail-grid">
+  <article class="panel">
+    <div class="eyebrow">Job detayı</div>
+    <h1>{{ job.query }}</h1>
+    <div class="meta-grid">
+      <div><span>Job ID</span><strong>{{ job.job_id }}</strong></div>
+      <div><span>Durum</span><strong>{{ job.status }}</strong></div>
+      <div><span>Oluşturulma</span><strong>{{ job.created_at }}</strong></div>
+      <div><span>Place ID</span><strong>{{ job.place_id or "-" }}</strong></div>
+      <div><span>Lang</span><strong>{{ job.lang }}</strong></div>
+      <div><span>Geo</span><strong>{{ job.geo or "-" }}</strong></div>
+      <div><span>Zoom</span><strong>{{ job.zoom if job.zoom is not none else "-" }}</strong></div>
+      <div><span>Radius</span><strong>{{ job.radius if job.radius is not none else "-" }}</strong></div>
+      <div><span>Email</span><strong>{{ job.email }}</strong></div>
+      <div><span>Fast mode</span><strong>{{ job.fast_mode }}</strong></div>
+      <div><span>Extra reviews</span><strong>{{ job.extra_reviews }}</strong></div>
+      <div><span>Result count</span><strong>{{ job.result_count if job.result_count is defined else "-" }}</strong></div>
+    </div>
+
+    {% if job.error %}
+    <div class="alert error">{{ job.error }}</div>
+    {% endif %}
+
+    <div class="actions block-actions">
+      <a href="/dashboard">Listeye dön</a>
+      <a href="/api/jobs/{{ job.job_id }}">API cevabı</a>
+      {% if job.result_url %}
+      <a href="{{ job.result_url }}">JSON sonucu</a>
+      {% endif %}
+      {% if job.download_url %}
+      <a href="{{ job.download_url }}">Dosya indir</a>
+      {% endif %}
+    </div>
+  </article>
+
+  <article class="panel">
+    <div class="eyebrow">Preview</div>
+    <h2>İlk 5 kayıt</h2>
+    {% if preview_error %}
+    <div class="alert error">{{ preview_error }}</div>
+    {% elif preview %}
+    <pre class="json-preview">{{ preview | tojson(indent=2) }}</pre>
+    {% else %}
+    <p class="empty-state">Bu job için şu anda preview yok.</p>
+    {% endif %}
+  </article>
+</section>
+{% endblock %}

@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Dashboard{% endblock %}</title>
+  <link rel="stylesheet" href="{{ request.url_for('static', path='admin.css') }}">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="topbar">
+      <div>
+        <a class="brand" href="/dashboard">GeoLocalRank Scraper</a>
+        <p class="subhead">Tek kullanıcılı, server-rendered operasyon paneli</p>
+      </div>
+      {% if csrf_token %}
+      <form action="/admin/logout" method="post" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="ghost-button">Çıkış</button>
+      </form>
+      {% endif %}
+    </header>
+    <main class="content">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>
