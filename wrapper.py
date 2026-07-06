@@ -992,6 +992,16 @@ async def _create_job_internal(body: dict) -> tuple[dict, int]:
             payload["email"] = True
         if geo:
             payload["geo"] = geo
+            # BUGFIX: gosom, fast_mode açıkken "geo" stringini ayrıştırmıyor ve
+            # 422 "missing geo coordinates" dönüyor — lat/lon'u AYRICA gönder
+            # (fast_mode'suz yol geo'yu kabul ediyor; ikisini birden göndermek güvenli).
+            try:
+                _lat, _lon = [p.strip() for p in str(geo).split(",", 1)]
+                if _lat and _lon:
+                    payload["lat"] = _lat
+                    payload["lon"] = _lon
+            except ValueError:
+                pass
         if zoom is not None:
             payload["zoom"] = zoom
         if radius is not None:
