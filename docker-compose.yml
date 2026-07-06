@@ -22,6 +22,12 @@ services:
       - ./gmapsdata:/gmapsdata
     command: ["-data-folder", "/gmapsdata"]
     restart: unless-stopped
+    # Chromium paylaşımlı bellek: Docker default /dev/shm 64 MB → renderer crash
+    # ("Target closed"). RAM bol olsa BİLE scraper bu yüzden ölüyordu. 2 GB shm çözer.
+    shm_size: "2gb"
+    # Bellek tavanı: bir job tüm sunucuyu değil YALNIZ kendini OOM'a düşürsün
+    # (diğer servisleri korur); job biter → RAM bırakılır.
+    mem_limit: 8g
     depends_on:
       - redis
 
