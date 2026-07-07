@@ -1,42 +1,39 @@
-version: '3.8'
-
 services:
-  # 1. Redis
+  # 1. Redis — job state store (sadece iç Docker ağı, dışa kapalı)
   redis:
     image: redis:alpine
-    container_name: redis_cache
+    container_name: gmaps_redis
     restart: unless-stopped
-    ports:
-      - "6379:6379"
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
 
-  # 2. Google Maps Scraper
+  # 2. Google Maps Scraper (gosom)
+  # ÖNEMLİ: -rod varyantı kullan. Düz ":latest" (Playwright) çalışma anında
+  # sürücüyü ölü Azure CDN'den indirmeye çalışıp 404 alır ve job'lar takılır.
+  # -rod native Chrome (go-rod) kullanır, sürücü indirmez.
   gmaps-scraper:
-    image: gosom/google-maps-scraper:latest
-    container_name: google_maps_scraper
-    ports:
-      - "8085:8080"
+    image: gosom/google-maps-scraper:latest-rod
+    container_name: gmaps_scraper_engine
     volumes:
       - ./gmapsdata:/gmapsdata
     command: ["-data-folder", "/gmapsdata"]
     restart: unless-stopped
-    # Chromium paylaşımlı bellek: Docker default /dev/shm 64 MB → renderer crash
-    # ("Target closed"). RAM bol olsa BİLE scraper bu yüzden ölüyordu. 2 GB shm çözer.
+    # Chromium paylaşımlı bellek: default /dev/shm 64MB → renderer "Target closed"
+    # crash. 2GB güvenli. (RAM bol olsa bile bu sınır ayrı bir kaynaktır.)
     shm_size: "2gb"
-    # Bellek tavanı: bir job tüm sunucuyu değil YALNIZ kendini OOM'a düşürsün
-    # (diğer servisleri korur); job biter → RAM bırakılır.
+    # Bellek tavanı: bir job tüm sunucuyu değil YALNIZ kendini OOM etsin
+    # (paylaşımlı sunucudaki diğer servisleri korur).
     mem_limit: 8g
     depends_on:
       - redis
 
-  # 3. Senin Python Uygulaman (Wrapper)
+  # 3. Python Wrapper (FastAPI) — sadece 127.0.0.1'e bağlı, dışarıya nginx açar
   wrapper:
     build: .
     container_name: gmaps_wrapper
     ports:
-      - "8003:8000"
+      - "127.0.0.1:8003:8000"
     volumes:
       - ./gmapsdata:/app/gmapsdata
     environment:
