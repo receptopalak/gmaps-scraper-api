@@ -209,6 +209,9 @@ class JobRecord:
     radius: float | None = None
     email: bool = False
     fast_mode: bool = False
+    # "search" (eski /api/jobs) | "rank_scan" | "place"
+    kind: str = "search"
+    points: list | None = None
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -1127,6 +1130,184 @@ async def _create_job_internal(body: dict) -> tuple[dict, int]:
             pass
 
 
+# ---------------------------------------------------------------------------
+# Sıra ızgarası: tek arama, çok nokta, yalnız liste sırası (rank_only)
+# ---------------------------------------------------------------------------
+
+RANK_SCAN_MAX_POINTS = 121
+
+
+def _parse_rank_scan_body(body: dict) -> dict:
+    keyword = str(body.get("keyword", "")).strip()
+    if not keyword or len(keyword) > 200:
+        raise HTTPException(status_code=400, detail="keyword 1-200 karakter olmalı")
+    raw_points = body.get("points")
+    if not isinstance(raw_points, list) or not 1 <= len(raw_points) <= RANK_SCAN_MAX_POINTS:
+        raise HTTPException(status_code=400, detail=f"points 1-{RANK_SCAN_MAX_POINTS} nokta olmalı")
+    points = []
+    for p in raw_points:
+        try:
+            lat, lng = float(p["lat"]), float(p["lng"])
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="her nokta {lat, lng} sayıları olmalı")
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            raise HTTPException(status_code=400, detail="nokta koordinatı geçersiz")
+        points.append({"lat": lat, "lng": lng})
+    try:
+        zoom = int(body.get("zoom", 15))
+        depth = int(body.get("depth", 1))
+        lang = _normalize_lang(body.get("lang"))
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"zoom/depth/lang geçersiz: {e}")
+    if not 1 <= zoom <= 21:
+        raise HTTPException(status_code=400, detail="zoom 1-21 arasında olmalı")
+    if not 1 <= depth <= 10:
+        raise HTTPException(status_code=400, detail="depth 1-10 arasında olmalı")
+    return {"keyword": keyword, "points": points, "zoom": zoom, "depth": depth, "lang": lang}
+
+
+def _num(value, cast):
+    try:
+        return cast(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _slim_rank_row(row: dict) -> dict:
+    return {
+        "rank": row.get("rank"),
+        "sponsored": bool(row.get("sponsored")),
+        "title": row.get("title"),
+        "place_id": row.get("place_id"),
+        "cid": row.get("cid"),
+        "data_id": row.get("data_id"),
+        "rating": _num(row.get("review_rating"), float),
+        "review_count": _num(row.get("review_count"), int),
+        "category": row.get("category") or None,
+        "lat": _num(row.get("latitude"), float),
+        "lng": _num(row.get("longitude"), float),
+        "link": row.get("link"),
+    }
+
+
+def _rank_scan_points(points: list[dict], rows: list[dict]) -> list[dict]:
+    """Motor satırlarını (input_id = p<sıra>) noktalara dağıtır; organikler sırayla, reklamlar sonda.
+    Hiç satırı olmayan nokta observed=false: "kimse çıkmadı" değil "ölçülemedi"."""
+    grouped: dict[int, list[dict]] = {}
+    for row in rows:
+        m = re.fullmatch(r"p(\d+)", str(row.get("input_id") or ""))
+        if m and int(m.group(1)) < len(points):
+            grouped.setdefault(int(m.group(1)), []).append(row)
+    out = []
+    for i, p in enumerate(points):
+        items = sorted(grouped.get(i, []), key=lambda r: (r.get("rank") is None, r.get("rank") or 0))
+        out.append({"index": i, "lat": p["lat"], "lng": p["lng"], "observed": bool(items),
+                    "results": [_slim_rank_row(r) for r in items]})
+    return out
+
+
+async def _post_engine_job(payload: dict) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            res = await client.post(f"{GOSOM_API_URL}/jobs", json=payload)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Gosom'a bağlanılamadı: {e}")
+    if res.status_code != 201:
+        raise HTTPException(status_code=502, detail=f"Gosom job oluşturamadı: {res.status_code} - {res.text[:300]}")
+    try:
+        job_id = res.json().get("id")
+        _validate_job_id(job_id or "")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Gosom geçerli job id döndürmedi")
+    return job_id
+
+
+def _rank_scan_payload(rec: JobRecord) -> dict:
+    payload = {"scan_id": rec.job_id, "status": rec.status, "keyword": rec.query, "zoom": rec.zoom,
+               "depth": rec.depth, "lang": rec.lang, "point_count": len(rec.points or []),
+               "created_at": rec.created_at}
+    if rec.status == "failed":
+        payload["error"] = rec.error
+    return payload
+
+
+async def _create_rank_scan_internal(body: dict) -> tuple[dict, int]:
+    scan = _parse_rank_scan_body(body)
+    await _daily_cleanup()
+    job_id = await _post_engine_job({
+        "name": f"rankscan_{datetime.now().strftime('%H%M%S')}",
+        "keywords": [scan["keyword"]],
+        "lang": scan["lang"],
+        "depth": scan["depth"],
+        "max_reviews": 0,
+        "max_time": 1800,
+        "zoom": scan["zoom"],
+        "rank_only": True,
+        "points": [{"lat": p["lat"], "lon": p["lng"]} for p in scan["points"]],
+    })
+    rec = JobRecord(job_id=job_id, query=scan["keyword"], depth=scan["depth"], max_reviews=0,
+                    status="pending", created_at=datetime.now().isoformat(), date=date.today().isoformat(),
+                    lang=scan["lang"], zoom=scan["zoom"], kind="rank_scan", points=scan["points"])
+    try:
+        await _save_job_to_redis(rec)
+    except Exception as redis_err:
+        log.error(f"[{job_id[:8]}] Sıra taraması kaydedilemedi: {redis_err}")
+        raise HTTPException(status_code=503, detail="Tarama başlatıldı ancak kaydedilemedi, tekrar dene")
+    await _save_index(rec.date)
+    task = asyncio.create_task(_poll_and_finalize(rec))
+    _active_tasks.add(task)
+    task.add_done_callback(_active_tasks.discard)
+    log.info(f"Yeni sıra taraması: {job_id[:8]} '{scan['keyword']}' {len(scan['points'])} nokta")
+    return _rank_scan_payload(rec), 201
+
+
+# ---------------------------------------------------------------------------
+# İşletme detayı: tek işletmenin tam profili (saat, yorumlar, fotoğraflar...)
+# ---------------------------------------------------------------------------
+
+_PLACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,256}$")
+
+
+def _place_job_body(body: dict) -> dict:
+    """Motorun place_ids modu: arama yapmadan işletme sayfası doğrudan açılır."""
+    place_id = str(body.get("place_id") or "").strip()
+    if not _PLACE_ID_RE.match(place_id):
+        raise HTTPException(status_code=400, detail="geçerli bir place_id gerekli")
+    try:
+        max_reviews = int(body.get("max_reviews", 20))
+        lang = _normalize_lang(body.get("lang"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="max_reviews/lang geçersiz")
+    if not 0 <= max_reviews <= 500:
+        raise HTTPException(status_code=400, detail="max_reviews 0-500 arasında olmalı")
+    return {"name": f"place_{datetime.now().strftime('%H%M%S')}", "place_ids": [place_id], "lang": lang,
+            "depth": 1, "max_reviews": max_reviews, "extra_reviews": max_reviews > 0, "max_time": 600}
+
+
+def _pick_place(rows: list[dict], place_id: str) -> dict | None:
+    return next((r for r in rows if r.get("place_id") == place_id), None)
+
+
+async def _create_place_internal(body: dict) -> tuple[dict, int]:
+    engine_body = _place_job_body(body)
+    place_id = engine_body["place_ids"][0]
+    await _daily_cleanup()
+    job_id = await _post_engine_job(engine_body)
+    rec = JobRecord(job_id=job_id, query=str(body.get("name") or place_id)[:200], depth=1,
+                    max_reviews=engine_body["max_reviews"], status="pending",
+                    created_at=datetime.now().isoformat(), date=date.today().isoformat(),
+                    lang=engine_body["lang"], place_id=place_id, kind="place")
+    try:
+        await _save_job_to_redis(rec)
+    except Exception:
+        raise HTTPException(status_code=503, detail="İşletme detayı başlatıldı ancak kaydedilemedi, tekrar dene")
+    await _save_index(rec.date)
+    task = asyncio.create_task(_poll_and_finalize(rec))
+    _active_tasks.add(task)
+    task.add_done_callback(_active_tasks.discard)
+    return _job_payload(rec), 201
+
+
 async def _get_dashboard_session_or_redirect(request: Request):
     session_data = await _get_admin_session(request)
     if not session_data:
@@ -1366,6 +1547,54 @@ async def get_result_json(job_id: str):
         raise HTTPException(status_code=422, detail=f"Job başarısız: {rec.error}")
 
     return await _build_result_response(rec, inline=True)
+
+
+# ---------------------------------------------------------------------------
+# /api/rank-scans — sıra ızgarası; /api/places — işletme detayı
+# ---------------------------------------------------------------------------
+
+async def _get_kind_record(job_id: str, kind: str) -> JobRecord:
+    try:
+        _validate_job_id(job_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Geçersiz kimlik formatı")
+    rec = await _get_job_from_redis(job_id)
+    if not rec or rec.kind != kind:
+        raise HTTPException(status_code=404, detail="Kayıt bulunamadı")
+    return rec
+
+
+@app.post("/api/rank-scans", dependencies=[Depends(require_api_key)])
+async def create_rank_scan(body: dict):
+    content, status_code = await _create_rank_scan_internal(body)
+    return UTF8JSONResponse(content=content, status_code=status_code)
+
+
+@app.get("/api/rank-scans/{scan_id}", dependencies=[Depends(require_api_key)])
+async def get_rank_scan(scan_id: str):
+    rec = await _get_kind_record(scan_id, "rank_scan")
+    payload = _rank_scan_payload(rec)
+    if rec.status == "ok":
+        rows = json.loads(await _get_result_content_or_raise(rec) or "[]")
+        payload["points"] = _rank_scan_points(rec.points or [], rows)
+        payload["observed_point_count"] = sum(1 for p in payload["points"] if p["observed"])
+    return UTF8JSONResponse(content=payload, status_code=202 if rec.status == "pending" else 200)
+
+
+@app.post("/api/places", dependencies=[Depends(require_api_key)])
+async def create_place(body: dict):
+    content, status_code = await _create_place_internal(body)
+    return UTF8JSONResponse(content=content, status_code=status_code)
+
+
+@app.get("/api/places/{job_id}", dependencies=[Depends(require_api_key)])
+async def get_place(job_id: str):
+    rec = await _get_kind_record(job_id, "place")
+    payload = _job_payload(rec)
+    if rec.status == "ok":
+        rows = json.loads(await _get_result_content_or_raise(rec) or "[]")
+        payload["place"] = _pick_place(rows, rec.place_id or "")
+    return UTF8JSONResponse(content=payload, status_code=202 if rec.status == "pending" else 200)
 
 
 @app.get("/guide", response_class=HTMLResponse)

@@ -477,20 +477,22 @@ index 198c263..b9d4db0 100644
  
  	if j.ExitMonitor != nil {
 diff --git a/gmaps/place.go b/gmaps/place.go
-index 21fa66e..5231f15 100644
+index 21fa66e..f157455 100644
 --- a/gmaps/place.go
 +++ b/gmaps/place.go
-@@ -22,6 +22,9 @@ type PlaceJob struct {
+@@ -22,6 +22,11 @@ type PlaceJob struct {
  	ExitMonitor             exiter.Exiter
  	ExtractExtraReviews     bool
  	WriterManagedCompletion bool
 +	// Arama listesindeki konum; sayfa paralel açılsa da korunur.
 +	Rank      int
 +	Sponsored bool
++	// MaxReviews: çekilecek en fazla yorum (0 = sınırsız).
++	MaxReviews int
  }
  
  func NewPlaceJob(parentID, langCode, u string, extractEmail, extraExtraReviews bool, opts ...PlaceJobOptions) *PlaceJob {
-@@ -65,6 +68,14 @@ func WithPlaceJobWriterManagedCompletion() PlaceJobOptions {
+@@ -65,6 +70,14 @@ func WithPlaceJobWriterManagedCompletion() PlaceJobOptions {
  	}
  }
  
@@ -505,7 +507,7 @@ index 21fa66e..5231f15 100644
  func (j *PlaceJob) ProcessOnFetchError() bool {
  	return true
  }
-@@ -103,6 +114,8 @@ func (j *PlaceJob) Process(_ context.Context, resp *scrapemate.Response) (any, [
+@@ -103,6 +116,8 @@ func (j *PlaceJob) Process(_ context.Context, resp *scrapemate.Response) (any, [
  	}
  
  	entry.ID = j.ParentID
@@ -514,16 +516,27 @@ index 21fa66e..5231f15 100644
  
  	if entry.Link == "" {
  		entry.Link = j.GetURL()
+@@ -179,6 +194,9 @@ func (j *PlaceJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPa
+ 
+ 	if j.ExtractExtraReviews {
+ 		reviewCount := j.getReviewCount(raw)
++		if j.MaxReviews > 0 && reviewCount > j.MaxReviews {
++			reviewCount = j.MaxReviews
++		}
+ 		if reviewCount > 0 { // download reviews for any place that has them
+ 			params := fetchReviewsParams{
+ 				page:        page,
 diff --git a/gmaps/rankgrid.go b/gmaps/rankgrid.go
 new file mode 100644
-index 0000000..7eda62b
+index 0000000..a4a499f
 --- /dev/null
 +++ b/gmaps/rankgrid.go
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,60 @@
 +package gmaps
 +
 +import (
 +	"fmt"
++	"net/url"
 +	"strconv"
 +
 +	"github.com/gosom/scrapemate"
@@ -560,12 +573,31 @@ index 0000000..7eda62b
 +
 +	return jobs
 +}
++
++// PlaceIDJobs, arama yapmadan işletme sayfalarını place_id ile doğrudan açar.
++func PlaceIDJobs(placeIDs []string, langCode string, extraReviews bool, maxReviews int, exitMonitor exiter.Exiter) []scrapemate.IJob {
++	jobs := make([]scrapemate.IJob, 0, len(placeIDs))
++
++	for _, id := range placeIDs {
++		opts := []PlaceJobOptions{}
++		if exitMonitor != nil {
++			opts = append(opts, WithPlaceJobExitMonitor(exitMonitor))
++		}
++
++		u := "https://www.google.com/maps/place/?q=place_id:" + url.QueryEscape(id)
++		pj := NewPlaceJob(id, langCode, u, false, extraReviews, opts...)
++		pj.MaxReviews = maxReviews
++		jobs = append(jobs, pj)
++	}
++
++	return jobs
++}
 diff --git a/gmaps/rankgrid_test.go b/gmaps/rankgrid_test.go
 new file mode 100644
-index 0000000..22ce079
+index 0000000..34922d5
 --- /dev/null
 +++ b/gmaps/rankgrid_test.go
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,57 @@
 +package gmaps
 +
 +import (
@@ -593,8 +625,81 @@ index 0000000..22ce079
 +		}
 +	}
 +}
++
++func TestPlaceIDJobsOpenPlacePageDirectly(t *testing.T) {
++	jobs := PlaceIDJobs([]string{"ChIJk9X1Td-5yhQRiqAw0Mp4z3g"}, "tr", true, 40, nil)
++	if len(jobs) != 1 {
++		t.Fatalf("len = %d", len(jobs))
++	}
++
++	j := jobs[0].(*PlaceJob)
++	if j.URL != "https://www.google.com/maps/place/?q=place_id:ChIJk9X1Td-5yhQRiqAw0Mp4z3g" || j.ParentID != "ChIJk9X1Td-5yhQRiqAw0Mp4z3g" || !j.ExtractExtraReviews || !j.UseInResults() || j.MaxReviews != 40 {
++		t.Fatalf("job = %+v", j)
++	}
++}
++
++func TestExtractPlaceIDDoesNotPanic(t *testing.T) {
++	id, err := extractPlaceID("https://www.google.com/maps/place/X/data=!4m7!3m6!1s0x14cab:0x10!8m2")
++	if err != nil || id != "0x14cab:0x10" {
++		t.Fatalf("id = %q err = %v", id, err)
++	}
++}
++
++func TestReviewFetcherStopsAtRequestedCount(t *testing.T) {
++	f := &fetcher{params: fetchReviewsParams{reviewCount: 40}}
++	if f.haveEnough(1) || !f.haveEnough(2) {
++		t.Fatal("40 yorum için 2 sayfa yeterli olmalı")
++	}
++
++	if (&fetcher{}).haveEnough(10) {
++		t.Fatal("sınır yokken sayfalama durmamalı")
++	}
++}
+diff --git a/gmaps/reviews.go b/gmaps/reviews.go
+index 7a8b737..2e65ca7 100644
+--- a/gmaps/reviews.go
++++ b/gmaps/reviews.go
+@@ -76,7 +76,7 @@ func (f *fetcher) fetch(ctx context.Context) (FetchReviewsResponse, error) {
+ 
+ 	nextPageToken := extractNextPageToken(currentPageBody)
+ 
+-	for nextPageToken != "" {
++	for nextPageToken != "" && !f.haveEnough(len(ans.pages)) {
+ 		reviewURL, err = f.generateURL(f.params.mapURL, nextPageToken, 20, requestIDForSession)
+ 		if err != nil {
+ 			log.Printf("Error generating URL for token %s: %v", nextPageToken, err)
+@@ -96,6 +96,11 @@ func (f *fetcher) fetch(ctx context.Context) (FetchReviewsResponse, error) {
+ 	return ans, nil
+ }
+ 
++// haveEnough: her sayfa 20 yorum; istenen sayıya ulaşınca sayfalamayı bırak.
++func (f *fetcher) haveEnough(pages int) bool {
++	return f.params.reviewCount > 0 && pages*20 >= f.params.reviewCount
++}
++
+ // fetchWithBrowser uses Playwright to fetch the review API with browser cookies
+ func (f *fetcher) fetchWithBrowser(_ context.Context, initialURL, requestID string) (FetchReviewsResponse, error) {
+ 	ans := FetchReviewsResponse{}
+@@ -145,7 +150,7 @@ func (f *fetcher) fetchWithBrowser(_ context.Context, initialURL, requestID stri
+ 
+ 	// Get additional pages
+ 	nextPageToken := extractNextPageToken([]byte(data))
+-	for nextPageToken != "" && len(ans.pages) < 50 { // Limit to 50 pages
++	for nextPageToken != "" && len(ans.pages) < 50 && !f.haveEnough(len(ans.pages)) { // Limit to 50 pages
+ 		nextURL, err := f.generateURL(f.params.mapURL, nextPageToken, 20, requestID)
+ 		if err != nil {
+ 			break
+@@ -198,6 +203,8 @@ const hexMatchPattern = `0x[0-9a-fA-F]+:0x[0-9a-fA-F]+` // Hex format place ID
+ // extractPlaceID extracts the place ID from various Google Maps URL formats
+ func extractPlaceID(mapURL string) (string, error) {
+ 	patternsOnce.Do(func() {
++		// v1.11.1 hatası: harita hiç oluşturulmuyordu, ek yorum çekme her seferinde çöküyordu.
++		patterns = make(map[string]*regexp.Regexp)
+ 		// Try multiple patterns for extracting place ID
+ 		avail := []string{
+ 			`!1s([^!]+)`,                             // Standard format: !1s0x...
 diff --git a/runner/webrunner/webrunner.go b/runner/webrunner/webrunner.go
-index 61484f0..9b82c9c 100644
+index 61484f0..c9784fc 100644
 --- a/runner/webrunner/webrunner.go
 +++ b/runner/webrunner/webrunner.go
 @@ -14,6 +14,7 @@ import (
@@ -605,7 +710,7 @@ index 61484f0..9b82c9c 100644
  	"github.com/gosom/google-maps-scraper/runner"
  	"github.com/gosom/google-maps-scraper/tlmt"
  	"github.com/gosom/google-maps-scraper/web"
-@@ -177,25 +178,37 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
+@@ -177,25 +178,39 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
  	dedup := deduper.New()
  	exitMonitor := exiter.New()
  
@@ -623,7 +728,9 @@ index 61484f0..9b82c9c 100644
 -			}
 +	var seedJobs []scrapemate.IJob
 +
-+	if len(job.Data.Points) > 0 {
++	if len(job.Data.PlaceIDs) > 0 {
++		seedJobs = gmaps.PlaceIDJobs(job.Data.PlaceIDs, job.Data.Lang, w.cfg.ExtraReviews || job.Data.ExtraReviews, job.Data.MaxReviews, exitMonitor)
++	} else if len(job.Data.Points) > 0 {
 +		points := make([]gmaps.RankGridPoint, 0, len(job.Data.Points))
 +		for _, p := range job.Data.Points {
 +			points = append(points, gmaps.RankGridPoint{Lat: p.Lat, Lon: p.Lon})
@@ -648,7 +755,7 @@ index 61484f0..9b82c9c 100644
 +			}(),
 +			dedup,
 +			exitMonitor,
-+			w.cfg.ExtraReviews,
++			w.cfg.ExtraReviews || job.Data.ExtraReviews,
 +		)
 +	}
  
@@ -661,7 +768,7 @@ index 61484f0..9b82c9c 100644
  	if err != nil {
  		err2 := w.svc.Update(ctx, job)
  		if err2 != nil {
-@@ -205,6 +218,14 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
+@@ -205,9 +220,23 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
  		return err
  	}
  
@@ -676,11 +783,28 @@ index 61484f0..9b82c9c 100644
  	if len(seedJobs) > 0 {
  		exitMonitor.SetSeedCount(len(seedJobs))
  
++		if len(job.Data.PlaceIDs) > 0 {
++			// İşletme sayfası işleri tohum değil; bitişi tamamlanan sayfa sayısıyla izlenir.
++			exitMonitor.SetSeedCount(0)
++			exitMonitor.IncrPlacesFound(len(seedJobs))
++		}
++
+ 		allowedSeconds := max(60, len(seedJobs)*10*job.Data.Depth/50+120)
+ 
+ 		if job.Data.MaxTime > 0 {
 diff --git a/web/job.go b/web/job.go
-index 6b5924b..cc964e8 100644
+index 6b5924b..33636c4 100644
 --- a/web/job.go
 +++ b/web/job.go
-@@ -72,8 +72,22 @@ type JobData struct {
+@@ -3,6 +3,7 @@ package web
+ import (
+ 	"context"
+ 	"errors"
++	"regexp"
+ 	"time"
+ )
+ 
+@@ -72,9 +73,51 @@ type JobData struct {
  	Email    bool          `json:"email"`
  	MaxTime  time.Duration `json:"max_time"`
  	Proxies  []string      `json:"proxies"`
@@ -689,6 +813,13 @@ index 6b5924b..cc964e8 100644
 +	// Points: sıra ızgarası. Her nokta ayrı bir arama olur ve noktalar aynı
 +	// iş içinde paralel taranır; sonuç satırının input_id'si "p<sıra>" olur.
 +	Points []GeoPoint `json:"points"`
++	// PlaceIDs: arama yapmadan bu işletmelerin sayfaları doğrudan açılır
++	// (tam detay: saat, yorumlar, fotoğraflar, öznitelikler).
++	PlaceIDs []string `json:"place_ids"`
++	// ExtraReviews: işletme sayfasında yorumların tamamı da çekilir (iş bazında).
++	ExtraReviews bool `json:"extra_reviews"`
++	// MaxReviews: işletme sayfasında çekilecek en fazla yorum (0 = sınırsız).
++	MaxReviews int `json:"max_reviews"`
  }
  
 +// GeoPoint, ızgaradaki tek bir arama noktasıdır.
@@ -700,10 +831,32 @@ index 6b5924b..cc964e8 100644
 +// MaxGridPoints, tek işte taranabilecek en fazla nokta (11x11).
 +const MaxGridPoints = 121
 +
++var gmapsPlaceIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{10,256}$`)
++
++// MaxPlaceIDs, tek işte açılabilecek en fazla işletme sayfası.
++const MaxPlaceIDs = 50
++
  func (d *JobData) Validate() error {
++	if len(d.PlaceIDs) > 0 {
++		if len(d.PlaceIDs) > MaxPlaceIDs || len(d.Points) > 0 || d.FastMode || d.RankOnly {
++			return errors.New("place_ids cannot be combined with points, fast_mode or rank_only, max 50")
++		}
++
++		for _, id := range d.PlaceIDs {
++			if !gmapsPlaceIDPattern.MatchString(id) {
++				return errors.New("invalid place id")
++			}
++		}
++
++		if len(d.Keywords) == 0 {
++			d.Keywords = []string{"place"}
++		}
++	}
++
  	if len(d.Keywords) == 0 {
  		return errors.New("missing keywords")
-@@ -99,5 +113,29 @@ func (d *JobData) Validate() error {
+ 	}
+@@ -99,5 +142,29 @@ func (d *JobData) Validate() error {
  		return errors.New("missing geo coordinates")
  	}
  
@@ -735,10 +888,10 @@ index 6b5924b..cc964e8 100644
  }
 diff --git a/web/job_test.go b/web/job_test.go
 new file mode 100644
-index 0000000..a099995
+index 0000000..e42d3ca
 --- /dev/null
 +++ b/web/job_test.go
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,54 @@
 +package web
 +
 +import (
@@ -772,6 +925,22 @@ index 0000000..a099995
 +		d := base()
 +		mutate(&d)
 +
++		if err := d.Validate(); err == nil {
++			t.Errorf("%s: expected error", name)
++		}
++	}
++}
++
++func TestValidatePlaceIDs(t *testing.T) {
++	ok := JobData{Lang: "tr", Depth: 1, MaxTime: time.Minute, PlaceIDs: []string{"ChIJk9X1Td-5yhQRiqAw0Mp4z3g"}}
++	if err := ok.Validate(); err != nil || len(ok.Keywords) != 1 {
++		t.Fatalf("valid place job rejected: %v %v", err, ok.Keywords)
++	}
++
++	for name, d := range map[string]JobData{
++		"bad id":    {Lang: "tr", Depth: 1, MaxTime: time.Minute, PlaceIDs: []string{"x y"}},
++		"with grid": {Lang: "tr", Depth: 1, MaxTime: time.Minute, Zoom: 15, RankOnly: true, PlaceIDs: []string{"ChIJk9X1Td-5yhQR"}, Points: []GeoPoint{{1, 1}}},
++	} {
 +		if err := d.Validate(); err == nil {
 +			t.Errorf("%s: expected error", name)
 +		}
