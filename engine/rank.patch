@@ -1,5 +1,5 @@
 diff --git a/gmaps/entry.go b/gmaps/entry.go
-index c8ec562..3638df3 100644
+index c8ec562..4526176 100644
 --- a/gmaps/entry.go
 +++ b/gmaps/entry.go
 @@ -95,6 +95,12 @@ type Entry struct {
@@ -15,23 +15,25 @@ index c8ec562..3638df3 100644
  }
  
  func (e *Entry) haversineDistance(lat, lon float64) float64 {
-@@ -192,6 +198,9 @@ func (e *Entry) CsvHeaders() []string {
+@@ -192,6 +198,10 @@ func (e *Entry) CsvHeaders() []string {
  		"user_reviews",
  		"user_reviews_extended",
  		"emails",
 +		"rank",
 +		"sponsored",
 +		"position",
++		"categories",
  	}
  }
  
-@@ -231,6 +240,9 @@ func (e *Entry) CsvRow() []string {
+@@ -231,6 +241,10 @@ func (e *Entry) CsvRow() []string {
  		stringify(e.UserReviews),
  		stringify(e.UserReviewsExtended),
  		stringSliceToString(e.Emails),
 +		strconv.Itoa(e.Rank),
 +		strconv.FormatBool(e.Sponsored),
 +		strconv.Itoa(e.Position),
++		stringify(e.Categories),
  	}
  }
  
@@ -220,10 +222,10 @@ index 0000000..4d50195
 +}
 diff --git a/gmaps/feedrank_test.go b/gmaps/feedrank_test.go
 new file mode 100644
-index 0000000..50d9d31
+index 0000000..b37d991
 --- /dev/null
 +++ b/gmaps/feedrank_test.go
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,162 @@
 +package gmaps
 +
 +import (
@@ -302,16 +304,23 @@ index 0000000..50d9d31
 +}
 +
 +func TestEntryCsvCarriesRank(t *testing.T) {
-+	e := Entry{Rank: 7, Sponsored: false, Position: 9}
++	e := Entry{Rank: 7, Sponsored: false, Position: 9, Categories: []string{"İşitme Cihazları Satıcısı", "Odyolog"}}
 +
 +	headers, row := e.CsvHeaders(), e.CsvRow()
 +	if len(headers) != len(row) {
 +		t.Fatalf("headers %d != row %d", len(headers), len(row))
 +	}
 +
-+	n := len(headers)
-+	if headers[n-3] != "rank" || row[n-3] != "7" || headers[n-2] != "sponsored" || row[n-2] != "false" || headers[n-1] != "position" || row[n-1] != "9" {
-+		t.Fatalf("columns = %v / %v", headers[n-3:], row[n-3:])
++	col := map[string]string{}
++	for i, h := range headers {
++		col[h] = row[i]
++	}
++	if col["rank"] != "7" || col["sponsored"] != "false" || col["position"] != "9" {
++		t.Fatalf("rank columns = %v", col)
++	}
++	// Kategori listesi JSON olarak dışarı çıkar (önceden hiç yazılmıyordu).
++	if col["categories"] != `["İşitme Cihazları Satıcısı","Odyolog"]` {
++		t.Fatalf("categories = %q", col["categories"])
 +	}
 +}
 +
