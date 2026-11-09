@@ -33,13 +33,16 @@ index c8ec562..b204619 100644
  
 diff --git a/gmaps/feedrank.go b/gmaps/feedrank.go
 new file mode 100644
-index 0000000..f4f93c8
+index 0000000..32e23f6
 --- /dev/null
 +++ b/gmaps/feedrank.go
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,176 @@
 +package gmaps
 +
 +import (
++	"net/url"
++	"regexp"
++	"strconv"
 +	"strings"
 +
 +	"github.com/PuerkitoBio/goquery"
@@ -118,12 +121,104 @@ index 0000000..f4f93c8
 +		walkText(c, fn)
 +	}
 +}
++
++var (
++	reDataID  = regexp.MustCompile(`!1s(0x[0-9a-fA-F]+:0x[0-9a-fA-F]+)`)
++	reLat     = regexp.MustCompile(`!3d(-?\d+(?:\.\d+)?)`)
++	reLng     = regexp.MustCompile(`!4d(-?\d+(?:\.\d+)?)`)
++	rePlaceID = regexp.MustCompile(`!19s([A-Za-z0-9_-]+)`)
++	reNumbers = regexp.MustCompile(`\d+(?:[.,]\d+)*`)
++)
++
++// FeedEntries, sonuç listesini işletme sayfası açmadan kayıtlara çevirir.
++// Sıra ölçümü için yeterli bilgi kartın kendisinde vardır.
++func FeedEntries(doc *goquery.Document, jobID string) []*Entry {
++	var entries []*Entry
++
++	organic := 0
++
++	doc.Find(`div[role=feed] div[jsaction]>a`).Each(func(_ int, s *goquery.Selection) {
++		href := s.AttrOr("href", "")
++		if href == "" {
++			return
++		}
++
++		card := s.Parent()
++		e := placeURLEntry(href, jobID)
++		e.Rank = 0
++		e.Sponsored = isSponsoredCard(card)
++
++		if !e.Sponsored {
++			organic++
++			e.Rank = organic
++		}
++
++		if title := strings.TrimSpace(s.AttrOr("aria-label", "")); title != "" {
++			e.Title = title
++		}
++
++		if label, ok := card.Find(`span[role=img][aria-label]`).First().Attr("aria-label"); ok {
++			nums := reNumbers.FindAllString(label, 2)
++			if len(nums) == 2 {
++				e.ReviewRating, _ = strconv.ParseFloat(strings.ReplaceAll(nums[0], ",", "."), 64)
++				e.ReviewCount, _ = strconv.Atoi(strings.NewReplacer(".", "", ",", "").Replace(nums[1]))
++			}
++		}
++
++		e.Category = strings.TrimSpace(card.Find(`.W4Efsd .W4Efsd > span > span`).First().Text())
++
++		entries = append(entries, e)
++	})
++
++	return entries
++}
++
++// placeURLEntry, bir /maps/place/ bağlantısındaki kimlik ve konumu okur.
++// Arama doğrudan tek bir işletmeye gittiğinde de kullanılır (sıra 1).
++func placeURLEntry(u, jobID string) *Entry {
++	e := &Entry{ID: jobID, Link: u, Rank: 1}
++
++	if i := strings.Index(u, "/maps/place/"); i >= 0 {
++		name := u[i+len("/maps/place/"):]
++		if j := strings.IndexAny(name, "/?"); j >= 0 {
++			name = name[:j]
++		}
++
++		if decoded, err := url.QueryUnescape(name); err == nil {
++			e.Title = decoded
++		}
++	}
++
++	if m := reDataID.FindStringSubmatch(u); m != nil {
++		e.DataID = m[1]
++
++		if parts := strings.SplitN(m[1], ":", 2); len(parts) == 2 {
++			if cid, err := strconv.ParseUint(strings.TrimPrefix(parts[1], "0x"), 16, 64); err == nil {
++				e.Cid = strconv.FormatUint(cid, 10)
++			}
++		}
++	}
++
++	if m := reLat.FindStringSubmatch(u); m != nil {
++		e.Latitude, _ = strconv.ParseFloat(m[1], 64)
++	}
++
++	if m := reLng.FindStringSubmatch(u); m != nil {
++		e.Longtitude, _ = strconv.ParseFloat(m[1], 64)
++	}
++
++	if m := rePlaceID.FindStringSubmatch(u); m != nil {
++		e.PlaceID = m[1]
++	}
++
++	return e
++}
 diff --git a/gmaps/feedrank_test.go b/gmaps/feedrank_test.go
 new file mode 100644
-index 0000000..88aa95c
+index 0000000..cd5d1cc
 --- /dev/null
 +++ b/gmaps/feedrank_test.go
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,154 @@
 +package gmaps
 +
 +import (
@@ -217,11 +312,124 @@ index 0000000..88aa95c
 +		t.Fatalf("sponsored column = %q/%q", headers[len(headers)-1], row[len(row)-1])
 +	}
 +}
++
++// Gerçek bir Google Haritalar kartından (Kasım 2026) sadeleştirilmiş örnek.
++const realCard = `<div jsaction="x"><a class="hfpxzc" aria-label="İdis İşitme Cihazları - Kadıköy" href="https://www.google.com/maps/place/%C4%B0dis/data=!4m7!3m6!1s0x14cab86f829fc339:0xcab0a54518fd8b7f!8m2!3d40.9895532!4d29.0311416!16s%2Fg%2F1tfn4yq0!19sChIJOcOfgm-4yhQRf4v9GEWlsMo?authuser=0&amp;hl=tr&amp;rclk=1"></a>` +
++	`<div><div class="qBF1Pd">İdis İşitme Cihazları - Kadıköy</div><span role="img" class="ZkP5Je" aria-label="4,9 yıldızlı 562 Yorum"><span>4,9</span><span>(562)</span></span>` +
++	`<div class="W4Efsd"><div class="W4Efsd"><span><span>İşitme Cihazları Satıcısı</span></span><span> · </span><span>Kuşdili Cd. No:14</span></div></div></div></div>`
++
++func TestFeedEntriesBuildRankedEntriesFromCards(t *testing.T) {
++	html := `<div role="feed">` +
++		`<div jsaction="x"><a aria-label="Reklam Yeri" href="https://www.google.com/maps/place/R/data=!4m7!3m6!1s0x1:0x2!8m2!3d41!4d29!19sChIJad"></a><div><span>Sponsorlu</span></div></div>` +
++		realCard +
++		`<div jsaction="x"><a aria-label="Yorumsuz Yer" href="https://www.google.com/maps/place/Y/data=!4m7!3m6!1s0x14cab:0xff!8m2!3d-1.5!4d-2.25"></a><div>Yeni açıldı</div></div>` +
++		`</div>`
++
++	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	got := FeedEntries(doc, "job-1")
++	if len(got) != 3 {
++		t.Fatalf("len = %d", len(got))
++	}
++
++	ad := got[0]
++	if !ad.Sponsored || ad.Rank != 0 || ad.Title != "Reklam Yeri" {
++		t.Errorf("ad = %+v", *ad)
++	}
++
++	e := got[1]
++	if e.ID != "job-1" || e.Rank != 1 || e.Sponsored || e.Title != "İdis İşitme Cihazları - Kadıköy" {
++		t.Errorf("rank/title = %+v", *e)
++	}
++
++	if e.DataID != "0x14cab86f829fc339:0xcab0a54518fd8b7f" || e.Cid != "14605355307753114495" || e.PlaceID != "ChIJOcOfgm-4yhQRf4v9GEWlsMo" {
++		t.Errorf("ids = %q %q %q", e.DataID, e.Cid, e.PlaceID)
++	}
++
++	if e.Latitude != 40.9895532 || e.Longtitude != 29.0311416 {
++		t.Errorf("coords = %v,%v", e.Latitude, e.Longtitude)
++	}
++
++	if e.ReviewRating != 4.9 || e.ReviewCount != 562 || e.Category != "İşitme Cihazları Satıcısı" {
++		t.Errorf("rating/category = %v %v %q", e.ReviewRating, e.ReviewCount, e.Category)
++	}
++
++	if !strings.HasPrefix(e.Link, "https://www.google.com/maps/place/") || strings.Contains(e.Link, "&amp;") {
++		t.Errorf("link = %q", e.Link)
++	}
++
++	plain := got[2]
++	if plain.Rank != 2 || plain.ReviewCount != 0 || plain.PlaceID != "" || plain.Latitude != -1.5 || plain.Longtitude != -2.25 || plain.Cid != "255" {
++		t.Errorf("plain = %+v", *plain)
++	}
++}
++
++func TestPlaceURLEntryForDirectRedirect(t *testing.T) {
++	e := placeURLEntry("https://www.google.com/maps/place/Tek+Yer/data=!4m7!3m6!1s0x14cab:0x10!8m2!3d41.1!4d29.2!19sChIJtek?hl=tr", "job-2")
++	if e == nil || e.Rank != 1 || e.Title != "Tek Yer" || e.Cid != "16" || e.PlaceID != "ChIJtek" || e.ID != "job-2" {
++		t.Fatalf("entry = %+v", e)
++	}
++}
 diff --git a/gmaps/job.go b/gmaps/job.go
-index 198c263..5e657b0 100644
+index 198c263..b9d4db0 100644
 --- a/gmaps/job.go
 +++ b/gmaps/job.go
-@@ -148,28 +148,29 @@ func (j *GmapJob) Process(ctx context.Context, resp *scrapemate.Response) (any,
+@@ -29,6 +29,9 @@ type GmapJob struct {
+ 	ExitMonitor             exiter.Exiter
+ 	ExtractExtraReviews     bool
+ 	WriterManagedCompletion bool
++	// RankOnly: işletme sayfaları açılmaz; sonuç listesindeki kartlar
++	// sıra, kimlik ve konumla doğrudan sonuç olarak yazılır.
++	RankOnly bool
+ }
+ 
+ func NewGmapJob(
+@@ -104,7 +107,16 @@ func WithWriterManagedCompletion() GmapJobOptions {
+ }
+ 
+ func (j *GmapJob) UseInResults() bool {
+-	return false
++	return j.RankOnly
++}
++
++// rankOnlyEntries: liste kartları; arama tek işletmeye yönlendiyse o işletme.
++func (j *GmapJob) rankOnlyEntries(doc *goquery.Document, respURL string) []*Entry {
++	if strings.Contains(respURL, "/maps/place/") {
++		return []*Entry{placeURLEntry(respURL, j.ID)}
++	}
++
++	return FeedEntries(doc, j.ID)
+ }
+ 
+ func (j *GmapJob) ProcessOnFetchError() bool {
+@@ -136,6 +148,23 @@ func (j *GmapJob) Process(ctx context.Context, resp *scrapemate.Response) (any,
+ 		return nil, nil, fmt.Errorf("could not convert to goquery document")
+ 	}
+ 
++	if j.RankOnly {
++		entries := j.rankOnlyEntries(doc, resp.URL)
++
++		if j.ExitMonitor != nil {
++			j.ExitMonitor.IncrPlacesFound(len(entries))
++			j.ExitMonitor.IncrSeedCompleted(1)
++
++			if !j.WriterManagedCompletion {
++				j.ExitMonitor.IncrPlacesCompleted(len(entries))
++			}
++		}
++
++		log.Info(fmt.Sprintf("%d places listed (rank only)", len(entries)))
++
++		return entries, nil, nil
++	}
++
+ 	var next []scrapemate.IJob
+ 
+ 	if strings.Contains(resp.URL, "/maps/place/") {
+@@ -148,28 +177,29 @@ func (j *GmapJob) Process(ctx context.Context, resp *scrapemate.Response) (any,
  			jopts = append(jopts, WithPlaceJobWriterManagedCompletion())
  		}
  
@@ -306,3 +514,266 @@ index 21fa66e..5231f15 100644
  
  	if entry.Link == "" {
  		entry.Link = j.GetURL()
+diff --git a/gmaps/rankgrid.go b/gmaps/rankgrid.go
+new file mode 100644
+index 0000000..7eda62b
+--- /dev/null
++++ b/gmaps/rankgrid.go
+@@ -0,0 +1,40 @@
++package gmaps
++
++import (
++	"fmt"
++	"strconv"
++
++	"github.com/gosom/scrapemate"
++
++	"github.com/gosom/google-maps-scraper/exiter"
++)
++
++// RankGridPoint, sıra ızgarasındaki bir arama noktasıdır.
++type RankGridPoint struct {
++	Lat float64
++	Lon float64
++}
++
++// RankGridJobs, her nokta için sadece-sıra modunda bir arama işi üretir.
++// İş kimliği "p<index>" olur ve sonuç satırlarında input_id olarak döner.
++// Noktalar arasında tekilleştirme yapılmaz: aynı işletme her noktada
++// kendi sırasıyla görünmelidir.
++func RankGridJobs(keyword, langCode string, points []RankGridPoint, zoom, depth int, exitMonitor exiter.Exiter) []scrapemate.IJob {
++	jobs := make([]scrapemate.IJob, 0, len(points))
++
++	for i, p := range points {
++		geo := strconv.FormatFloat(p.Lat, 'f', 7, 64) + "," + strconv.FormatFloat(p.Lon, 'f', 7, 64)
++
++		opts := []GmapJobOptions{}
++		if exitMonitor != nil {
++			opts = append(opts, WithExitMonitor(exitMonitor))
++		}
++
++		job := NewGmapJob(fmt.Sprintf("p%d", i), langCode, keyword, depth, false, geo, zoom, opts...)
++		job.RankOnly = true
++
++		jobs = append(jobs, job)
++	}
++
++	return jobs
++}
+diff --git a/gmaps/rankgrid_test.go b/gmaps/rankgrid_test.go
+new file mode 100644
+index 0000000..22ce079
+--- /dev/null
++++ b/gmaps/rankgrid_test.go
+@@ -0,0 +1,27 @@
++package gmaps
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestRankGridJobsOnePerPointWithStableIDs(t *testing.T) {
++	jobs := RankGridJobs("işitme cihazı", "tr", []RankGridPoint{{Lat: 40.991994, Lon: 29.033005}, {Lat: -1.5, Lon: 2.25}}, 15, 1, nil)
++	if len(jobs) != 2 {
++		t.Fatalf("len = %d", len(jobs))
++	}
++
++	for i, want := range []struct{ id, at string }{
++		{"p0", "/@40.9919940,29.0330050,15z"},
++		{"p1", "/@-1.5000000,2.2500000,15z"},
++	} {
++		j := jobs[i].(*GmapJob)
++		if j.ID != want.id || !j.RankOnly || !j.UseInResults() || j.Deduper != nil {
++			t.Errorf("job %d = id %q rankOnly %v dedup %v", i, j.ID, j.RankOnly, j.Deduper)
++		}
++
++		if !strings.Contains(j.URL, want.at) || !strings.Contains(j.URL, "/maps/search/i%C5%9Fitme+cihaz%C4%B1/") {
++			t.Errorf("url %d = %s", i, j.URL)
++		}
++	}
++}
+diff --git a/runner/webrunner/webrunner.go b/runner/webrunner/webrunner.go
+index 61484f0..9b82c9c 100644
+--- a/runner/webrunner/webrunner.go
++++ b/runner/webrunner/webrunner.go
+@@ -14,6 +14,7 @@ import (
+ 
+ 	"github.com/gosom/google-maps-scraper/deduper"
+ 	"github.com/gosom/google-maps-scraper/exiter"
++	"github.com/gosom/google-maps-scraper/gmaps"
+ 	"github.com/gosom/google-maps-scraper/runner"
+ 	"github.com/gosom/google-maps-scraper/tlmt"
+ 	"github.com/gosom/google-maps-scraper/web"
+@@ -177,25 +178,37 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
+ 	dedup := deduper.New()
+ 	exitMonitor := exiter.New()
+ 
+-	seedJobs, err := runner.CreateSeedJobs(
+-		job.Data.FastMode,
+-		job.Data.Lang,
+-		strings.NewReader(strings.Join(job.Data.Keywords, "\n")),
+-		job.Data.Depth,
+-		job.Data.Email,
+-		coords,
+-		job.Data.Zoom,
+-		func() float64 {
+-			if job.Data.Radius <= 0 {
+-				return 10000 // 10 km
+-			}
++	var seedJobs []scrapemate.IJob
++
++	if len(job.Data.Points) > 0 {
++		points := make([]gmaps.RankGridPoint, 0, len(job.Data.Points))
++		for _, p := range job.Data.Points {
++			points = append(points, gmaps.RankGridPoint{Lat: p.Lat, Lon: p.Lon})
++		}
++
++		seedJobs = gmaps.RankGridJobs(job.Data.Keywords[0], job.Data.Lang, points, job.Data.Zoom, job.Data.Depth, exitMonitor)
++	} else {
++		seedJobs, err = runner.CreateSeedJobs(
++			job.Data.FastMode,
++			job.Data.Lang,
++			strings.NewReader(strings.Join(job.Data.Keywords, "\n")),
++			job.Data.Depth,
++			job.Data.Email,
++			coords,
++			job.Data.Zoom,
++			func() float64 {
++				if job.Data.Radius <= 0 {
++					return 10000 // 10 km
++				}
++
++				return float64(job.Data.Radius)
++			}(),
++			dedup,
++			exitMonitor,
++			w.cfg.ExtraReviews,
++		)
++	}
+ 
+-			return float64(job.Data.Radius)
+-		}(),
+-		dedup,
+-		exitMonitor,
+-		w.cfg.ExtraReviews,
+-	)
+ 	if err != nil {
+ 		err2 := w.svc.Update(ctx, job)
+ 		if err2 != nil {
+@@ -205,6 +218,14 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
+ 		return err
+ 	}
+ 
++	if job.Data.RankOnly && !job.Data.FastMode {
++		for _, sj := range seedJobs {
++			if gj, ok := sj.(*gmaps.GmapJob); ok {
++				gj.RankOnly = true
++			}
++		}
++	}
++
+ 	if len(seedJobs) > 0 {
+ 		exitMonitor.SetSeedCount(len(seedJobs))
+ 
+diff --git a/web/job.go b/web/job.go
+index 6b5924b..cc964e8 100644
+--- a/web/job.go
++++ b/web/job.go
+@@ -72,8 +72,22 @@ type JobData struct {
+ 	Email    bool          `json:"email"`
+ 	MaxTime  time.Duration `json:"max_time"`
+ 	Proxies  []string      `json:"proxies"`
++	// RankOnly: yalnız sonuç listesi okunur (sıra ölçümü için).
++	RankOnly bool `json:"rank_only"`
++	// Points: sıra ızgarası. Her nokta ayrı bir arama olur ve noktalar aynı
++	// iş içinde paralel taranır; sonuç satırının input_id'si "p<sıra>" olur.
++	Points []GeoPoint `json:"points"`
+ }
+ 
++// GeoPoint, ızgaradaki tek bir arama noktasıdır.
++type GeoPoint struct {
++	Lat float64 `json:"lat"`
++	Lon float64 `json:"lon"`
++}
++
++// MaxGridPoints, tek işte taranabilecek en fazla nokta (11x11).
++const MaxGridPoints = 121
++
+ func (d *JobData) Validate() error {
+ 	if len(d.Keywords) == 0 {
+ 		return errors.New("missing keywords")
+@@ -99,5 +113,29 @@ func (d *JobData) Validate() error {
+ 		return errors.New("missing geo coordinates")
+ 	}
+ 
++	if len(d.Points) > 0 {
++		if !d.RankOnly || d.FastMode {
++			return errors.New("points require rank_only and no fast_mode")
++		}
++
++		if len(d.Keywords) != 1 {
++			return errors.New("points require exactly one keyword")
++		}
++
++		if len(d.Points) > MaxGridPoints {
++			return errors.New("too many points")
++		}
++
++		if d.Zoom < 1 || d.Zoom > 21 {
++			return errors.New("points require zoom between 1 and 21")
++		}
++
++		for _, p := range d.Points {
++			if p.Lat < -90 || p.Lat > 90 || p.Lon < -180 || p.Lon > 180 {
++				return errors.New("invalid point coordinates")
++			}
++		}
++	}
++
+ 	return nil
+ }
+diff --git a/web/job_test.go b/web/job_test.go
+new file mode 100644
+index 0000000..a099995
+--- /dev/null
++++ b/web/job_test.go
+@@ -0,0 +1,38 @@
++package web
++
++import (
++	"testing"
++	"time"
++)
++
++func TestValidateRankGridPoints(t *testing.T) {
++	base := func() JobData {
++		return JobData{Keywords: []string{"a"}, Lang: "tr", Depth: 1, MaxTime: time.Minute, Zoom: 15, RankOnly: true,
++			Points: []GeoPoint{{Lat: 40.9, Lon: 29.0}}}
++	}
++
++	ok := base()
++	if err := ok.Validate(); err != nil {
++		t.Fatalf("valid grid rejected: %v", err)
++	}
++
++	cases := map[string]func(*JobData){
++		"not rank only": func(d *JobData) { d.RankOnly = false },
++		"fast mode":     func(d *JobData) { d.FastMode = true; d.Lat = "1"; d.Lon = "1" },
++		"two keywords":  func(d *JobData) { d.Keywords = []string{"a", "b"} },
++		"no zoom":       func(d *JobData) { d.Zoom = 0 },
++		"bad lat":       func(d *JobData) { d.Points[0].Lat = 91 },
++		"too many": func(d *JobData) {
++			d.Points = make([]GeoPoint, MaxGridPoints+1)
++		},
++	}
++
++	for name, mutate := range cases {
++		d := base()
++		mutate(&d)
++
++		if err := d.Validate(); err == nil {
++			t.Errorf("%s: expected error", name)
++		}
++	}
++}
