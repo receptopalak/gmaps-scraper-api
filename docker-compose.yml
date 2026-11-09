@@ -12,8 +12,10 @@ services:
   # ÖNEMLİ: -rod varyantı kullan. Düz ":latest" (Playwright) çalışma anında
   # sürücüyü ölü Azure CDN'den indirmeye çalışıp 404 alır ve job'lar takılır.
   # -rod native Chrome (go-rod) kullanır, sürücü indirmez.
+  # engine/: gosom v1.11.1-rod + Google liste sırasını koruyan "rank" yaması.
   gmaps-scraper:
-    image: gosom/google-maps-scraper:latest-rod
+    build: ./engine
+    image: scraper-geolocalrank-engine:local
     container_name: gmaps_scraper_engine
     volumes:
       - ./gmapsdata:/gmapsdata

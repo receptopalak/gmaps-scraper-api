@@ -114,8 +114,25 @@ def _parse_csv(text: str) -> list[dict]:
     reader = csv.DictReader(io.StringIO(text))
     results = []
     for row in reader:
-        results.append({k: _clean_value(v) for k, v in row.items()})
+        item = {k: _clean_value(v) for k, v in row.items()}
+        if "rank" in item:
+            _apply_rank(item)
+        results.append(item)
+    # Motor satırları sayfanın bitme sırasıyla yazar. "rank" varsa çıktıyı
+    # Google'daki liste sırasına çevir; sponsorlu/bilinmeyenler sona.
+    if results and "rank" in results[0]:
+        results.sort(key=lambda r: (r["rank"] is None, r["rank"] or 0))
     return results
+
+
+def _apply_rank(item: dict) -> None:
+    """Motorun yazdığı rank/sponsored metnini sayı/boolean'a çevir; 0 → None."""
+    try:
+        rank = int(item.get("rank") or 0)
+    except (TypeError, ValueError):
+        rank = 0
+    item["rank"] = rank if rank > 0 else None
+    item["sponsored"] = str(item.get("sponsored") or "").strip().lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Cache key

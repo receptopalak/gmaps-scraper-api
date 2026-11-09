@@ -1,0 +1,308 @@
+diff --git a/gmaps/entry.go b/gmaps/entry.go
+index c8ec562..b204619 100644
+--- a/gmaps/entry.go
++++ b/gmaps/entry.go
+@@ -95,6 +95,10 @@ type Entry struct {
+ 	UserReviews         []Review               `json:"user_reviews"`
+ 	UserReviewsExtended []Review               `json:"user_reviews_extended"`
+ 	Emails              []string               `json:"emails"`
++	// Rank: sonuç listesindeki organik sıra (1'den başlar). 0 = bilinmiyor
++	// ya da sponsorlu. Sayfalar paralel işlendiği için satır sırası bunu vermez.
++	Rank      int  `json:"rank"`
++	Sponsored bool `json:"sponsored"`
+ }
+ 
+ func (e *Entry) haversineDistance(lat, lon float64) float64 {
+@@ -192,6 +196,8 @@ func (e *Entry) CsvHeaders() []string {
+ 		"user_reviews",
+ 		"user_reviews_extended",
+ 		"emails",
++		"rank",
++		"sponsored",
+ 	}
+ }
+ 
+@@ -231,6 +237,8 @@ func (e *Entry) CsvRow() []string {
+ 		stringify(e.UserReviews),
+ 		stringify(e.UserReviewsExtended),
+ 		stringSliceToString(e.Emails),
++		strconv.Itoa(e.Rank),
++		strconv.FormatBool(e.Sponsored),
+ 	}
+ }
+ 
+diff --git a/gmaps/feedrank.go b/gmaps/feedrank.go
+new file mode 100644
+index 0000000..f4f93c8
+--- /dev/null
++++ b/gmaps/feedrank.go
+@@ -0,0 +1,81 @@
++package gmaps
++
++import (
++	"strings"
++
++	"github.com/PuerkitoBio/goquery"
++	"golang.org/x/net/html"
++)
++
++// FeedLink, arama sonuç listesindeki bir işletme bağlantısı ve konumudur.
++type FeedLink struct {
++	Href string
++	// Rank: sponsorlu olmayan sonuçlar arasındaki sıra (1'den başlar).
++	// Sponsorlu sonuçta 0'dır.
++	Rank      int
++	Sponsored bool
++}
++
++// Google Haritalar'ın reklam kartlarına koyduğu etiketler. Kart metninde
++// tek başına bir kelime olarak geçtiklerinde kart sponsorlu sayılır.
++var sponsoredLabels = []string{
++	"sponsorlu", "sponsored", "gesponsert", "sponsorisé", "sponsorizzato",
++	"patrocinado", "patrocinada", "gesponsord", "sponsorowane", "реклама",
++	"спонсорство", "إعلان", "ممول", "広告", "광고", "赞助商", "贊助商家",
++}
++
++// FeedLinks, sonuç listesindeki bağlantıları sayfadaki sırayla döndürür.
++// Sıra, işletme sayfaları açılmadan burada sabitlenir.
++func FeedLinks(doc *goquery.Document) []FeedLink {
++	var links []FeedLink
++
++	organic := 0
++
++	doc.Find(`div[role=feed] div[jsaction]>a`).Each(func(_ int, s *goquery.Selection) {
++		href := s.AttrOr("href", "")
++		if href == "" {
++			return
++		}
++
++		link := FeedLink{Href: href, Sponsored: isSponsoredCard(s.Parent())}
++		if !link.Sponsored {
++			organic++
++			link.Rank = organic
++		}
++
++		links = append(links, link)
++	})
++
++	return links
++}
++
++// isSponsoredCard: kartta yalnız etiketten oluşan bir metin parçası varsa
++// reklamdır. Kartın birleşik metnine bakılmaz: öğeler arasında boşluk
++// olmadığı için "ŞubeSponsorlu" gibi birleşir, ve adında "Sponsorlu" geçen
++// bir işletme yanlışlıkla reklam sayılırdı.
++func isSponsoredCard(card *goquery.Selection) bool {
++	found := false
++
++	for _, n := range card.Nodes {
++		walkText(n, func(text string) {
++			t := strings.ToLower(strings.Trim(text, " \t\n ·•()"))
++			for _, label := range sponsoredLabels {
++				if t == label {
++					found = true
++				}
++			}
++		})
++	}
++
++	return found
++}
++
++func walkText(n *html.Node, fn func(string)) {
++	if n.Type == html.TextNode {
++		fn(n.Data)
++	}
++
++	for c := n.FirstChild; c != nil; c = c.NextSibling {
++		walkText(c, fn)
++	}
++}
+diff --git a/gmaps/feedrank_test.go b/gmaps/feedrank_test.go
+new file mode 100644
+index 0000000..88aa95c
+--- /dev/null
++++ b/gmaps/feedrank_test.go
+@@ -0,0 +1,93 @@
++package gmaps
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/PuerkitoBio/goquery"
++)
++
++func card(href, text string) string {
++	return `<div jsaction="x"><a href="` + href + `"></a><div>` + text + `</div></div>`
++}
++
++func TestFeedLinksKeepsPageOrderAndSkipsSponsored(t *testing.T) {
++	html := `<div role="feed">` +
++		card("https://maps/place/ad", "<span>Reklamcı Firma</span><span>· Sponsorlu</span>") +
++		card("https://maps/place/a", "Alfa İşitme 4,8") +
++		card("", "bağlantısız kart") +
++		card("https://maps/place/b", "Beta Sponsorluk Merkezi") +
++		card("https://maps/place/c", "<span>Gama</span><span>(Sponsored)</span>") +
++		card("https://maps/place/d", "Delta") +
++		`</div>`
++
++	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	want := []FeedLink{
++		{Href: "https://maps/place/ad", Rank: 0, Sponsored: true},
++		{Href: "https://maps/place/a", Rank: 1},
++		{Href: "https://maps/place/b", Rank: 2},
++		{Href: "https://maps/place/c", Rank: 0, Sponsored: true},
++		{Href: "https://maps/place/d", Rank: 3},
++	}
++
++	assertLinks(t, FeedLinks(doc), want)
++}
++
++// Google'ın gerçek kartında etiket ayrı bir öğededir ve öğeler arasında boşluk
++// yoktur: metin "İdealmed Merkez ŞubeSponsorlu" diye birleşir. Aynı işletme
++// hem reklam hem organik sonuç olarak gelebilir.
++func TestFeedLinksDetectsLabelInOwnElement(t *testing.T) {
++	html := `<div role="feed">` +
++		`<div jsaction="x"><a href="https://maps/place/ideal"></a><div><div>İdealmed Merkez Şube</div><span>Sponsorlu</span></div><div>5,0</div></div>` +
++		`<div jsaction="x"><a href="https://maps/place/idis-ad"></a><div><div>İdis</div><span>Sponsorlu</span></div></div>` +
++		`<div jsaction="x"><a href="https://maps/place/idis"></a><div><div>İdis</div><span>4,9</span></div></div>` +
++		`<div jsaction="x"><a href="https://maps/place/may"></a><div><div>May Sponsorlu Değil</div></div></div>` +
++		`</div>`
++
++	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	assertLinks(t, FeedLinks(doc), []FeedLink{
++		{Href: "https://maps/place/ideal", Sponsored: true},
++		{Href: "https://maps/place/idis-ad", Sponsored: true},
++		{Href: "https://maps/place/idis", Rank: 1},
++		{Href: "https://maps/place/may", Rank: 2},
++	})
++}
++
++func assertLinks(t *testing.T, got, want []FeedLink) {
++	t.Helper()
++
++	if len(got) != len(want) {
++		t.Fatalf("len = %d, want %d: %+v", len(got), len(want), got)
++	}
++
++	for i := range want {
++		if got[i] != want[i] {
++			t.Errorf("link %d = %+v, want %+v", i, got[i], want[i])
++		}
++	}
++}
++
++func TestEntryCsvCarriesRank(t *testing.T) {
++	e := Entry{Rank: 7, Sponsored: false}
++
++	headers, row := e.CsvHeaders(), e.CsvRow()
++	if len(headers) != len(row) {
++		t.Fatalf("headers %d != row %d", len(headers), len(row))
++	}
++
++	if headers[len(headers)-2] != "rank" || row[len(row)-2] != "7" {
++		t.Fatalf("rank column = %q/%q", headers[len(headers)-2], row[len(row)-2])
++	}
++
++	if headers[len(headers)-1] != "sponsored" || row[len(row)-1] != "false" {
++		t.Fatalf("sponsored column = %q/%q", headers[len(headers)-1], row[len(row)-1])
++	}
++}
+diff --git a/gmaps/job.go b/gmaps/job.go
+index 198c263..5e657b0 100644
+--- a/gmaps/job.go
++++ b/gmaps/job.go
+@@ -148,28 +148,29 @@ func (j *GmapJob) Process(ctx context.Context, resp *scrapemate.Response) (any,
+ 			jopts = append(jopts, WithPlaceJobWriterManagedCompletion())
+ 		}
+ 
++		// Arama doğrudan tek bir işletmeye gittiyse o işletme 1. sıradadır.
++		jopts = append(jopts, WithPlaceJobRank(1, false))
++
+ 		placeJob := NewPlaceJob(j.ID, j.LangCode, resp.URL, j.ExtractEmail, j.ExtractExtraReviews, jopts...)
+ 
+ 		next = append(next, placeJob)
+ 	} else {
+-		doc.Find(`div[role=feed] div[jsaction]>a`).Each(func(_ int, s *goquery.Selection) {
+-			if href := s.AttrOr("href", ""); href != "" {
+-				jopts := []PlaceJobOptions{}
+-				if j.ExitMonitor != nil {
+-					jopts = append(jopts, WithPlaceJobExitMonitor(j.ExitMonitor))
+-				}
+-
+-				if j.WriterManagedCompletion {
+-					jopts = append(jopts, WithPlaceJobWriterManagedCompletion())
+-				}
+-
+-				nextJob := NewPlaceJob(j.ID, j.LangCode, href, j.ExtractEmail, j.ExtractExtraReviews, jopts...)
+-
+-				if j.Deduper == nil || j.Deduper.AddIfNotExists(ctx, href) {
+-					next = append(next, nextJob)
+-				}
++		for _, link := range FeedLinks(doc) {
++			jopts := []PlaceJobOptions{WithPlaceJobRank(link.Rank, link.Sponsored)}
++			if j.ExitMonitor != nil {
++				jopts = append(jopts, WithPlaceJobExitMonitor(j.ExitMonitor))
++			}
++
++			if j.WriterManagedCompletion {
++				jopts = append(jopts, WithPlaceJobWriterManagedCompletion())
+ 			}
+-		})
++
++			nextJob := NewPlaceJob(j.ID, j.LangCode, link.Href, j.ExtractEmail, j.ExtractExtraReviews, jopts...)
++
++			if j.Deduper == nil || j.Deduper.AddIfNotExists(ctx, link.Href) {
++				next = append(next, nextJob)
++			}
++		}
+ 	}
+ 
+ 	if j.ExitMonitor != nil {
+diff --git a/gmaps/place.go b/gmaps/place.go
+index 21fa66e..5231f15 100644
+--- a/gmaps/place.go
++++ b/gmaps/place.go
+@@ -22,6 +22,9 @@ type PlaceJob struct {
+ 	ExitMonitor             exiter.Exiter
+ 	ExtractExtraReviews     bool
+ 	WriterManagedCompletion bool
++	// Arama listesindeki konum; sayfa paralel açılsa da korunur.
++	Rank      int
++	Sponsored bool
+ }
+ 
+ func NewPlaceJob(parentID, langCode, u string, extractEmail, extraExtraReviews bool, opts ...PlaceJobOptions) *PlaceJob {
+@@ -65,6 +68,14 @@ func WithPlaceJobWriterManagedCompletion() PlaceJobOptions {
+ 	}
+ }
+ 
++// WithPlaceJobRank, listedeki organik sırayı (1'den) ve sponsorlu bilgisini taşır.
++func WithPlaceJobRank(rank int, sponsored bool) PlaceJobOptions {
++	return func(j *PlaceJob) {
++		j.Rank = rank
++		j.Sponsored = sponsored
++	}
++}
++
+ func (j *PlaceJob) ProcessOnFetchError() bool {
+ 	return true
+ }
+@@ -103,6 +114,8 @@ func (j *PlaceJob) Process(_ context.Context, resp *scrapemate.Response) (any, [
+ 	}
+ 
+ 	entry.ID = j.ParentID
++	entry.Rank = j.Rank
++	entry.Sponsored = j.Sponsored
+ 
+ 	if entry.Link == "" {
+ 		entry.Link = j.GetURL()
