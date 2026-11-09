@@ -17,7 +17,7 @@ from urllib.parse import quote_plus
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -70,6 +70,31 @@ _ADMIN_LOGIN_ATTEMPT_LIMIT = 10
 _ADMIN_LOGIN_ATTEMPT_WINDOW = 900
 
 _password_hasher = PasswordHasher()
+
+# ---------------------------------------------------------------------------
+# API anahtarı: SCRAPER_API_KEYS (virgülle birden çok; anahtar değiştirirken
+# eskisi ve yenisi birlikte geçerli kalabilir). Boşsa API eskisi gibi açıktır.
+# ---------------------------------------------------------------------------
+
+def _parse_api_keys(raw: str) -> tuple[str, ...]:
+    return tuple(k.strip() for k in (raw or "").split(",") if k.strip())
+
+
+API_KEYS = _parse_api_keys(os.environ.get("SCRAPER_API_KEYS", ""))
+
+
+def require_api_key(request: Request) -> None:
+    if not API_KEYS:
+        return
+    supplied = request.headers.get("x-api-key", "").strip()
+    if not supplied:
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            supplied = auth[7:].strip()
+    if supplied and any(secrets.compare_digest(supplied, k) for k in API_KEYS):
+        return
+    raise HTTPException(status_code=401, detail="Geçerli API anahtarı gerekli (X-API-Key)")
+
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
@@ -820,6 +845,9 @@ async def _poll_and_finalize(rec: JobRecord):
 async def lifespan(app: FastAPI):
     global _redis
 
+    if not API_KEYS:
+        log.warning("SCRAPER_API_KEYS tanımlı değil: /api/jobs uçları anahtarsız açık.")
+
     # Startup — Redis bağlantısı
     _redis = aioredis.from_url(REDIS_URL, decode_responses=True)
     try:
@@ -1187,6 +1215,7 @@ def _guide_content(lang: str) -> dict:
             "examples": {
                 "create_title": "Create a job",
                 "create_code": """curl -X POST https://scraper.geolocalrank.com/api/jobs \\
+  -H 'X-API-Key: <api_key>' \\
   -H 'Content-Type: application/json' \\
   -d '{
     "query": "restaurants istanbul",
@@ -1195,9 +1224,9 @@ def _guide_content(lang: str) -> dict:
     "extra_reviews": true
   }'""",
                 "status_title": "Check job status",
-                "status_code": """curl https://scraper.geolocalrank.com/api/jobs/<job_id>""",
+                "status_code": """curl -H 'X-API-Key: <api_key>' https://scraper.geolocalrank.com/api/jobs/<job_id>""",
                 "result_title": "Fetch inline JSON result",
-                "result_code": """curl https://scraper.geolocalrank.com/api/jobs/<job_id>/result/json""",
+                "result_code": """curl -H 'X-API-Key: <api_key>' https://scraper.geolocalrank.com/api/jobs/<job_id>/result/json""",
             },
         }
 
@@ -1249,6 +1278,7 @@ def _guide_content(lang: str) -> dict:
         "examples": {
             "create_title": "Job oluşturma",
             "create_code": """curl -X POST https://scraper.geolocalrank.com/api/jobs \\
+  -H 'X-API-Key: <api_key>' \\
   -H 'Content-Type: application/json' \\
   -d '{
     "query": "restaurants istanbul",
@@ -1257,9 +1287,9 @@ def _guide_content(lang: str) -> dict:
     "extra_reviews": true
   }'""",
             "status_title": "Job durumunu kontrol et",
-            "status_code": """curl https://scraper.geolocalrank.com/api/jobs/<job_id>""",
+            "status_code": """curl -H 'X-API-Key: <api_key>' https://scraper.geolocalrank.com/api/jobs/<job_id>""",
             "result_title": "Inline JSON sonucu al",
-            "result_code": """curl https://scraper.geolocalrank.com/api/jobs/<job_id>/result/json""",
+            "result_code": """curl -H 'X-API-Key: <api_key>' https://scraper.geolocalrank.com/api/jobs/<job_id>/result/json""",
         },
     }
 
@@ -1267,7 +1297,7 @@ def _guide_content(lang: str) -> dict:
 # POST /api/jobs — Job oluştur veya cache hit dön
 # ---------------------------------------------------------------------------
 
-@app.post("/api/jobs")
+@app.post("/api/jobs", dependencies=[Depends(require_api_key)])
 async def create_job(body: dict):
     content, status_code = await _create_job_internal(body)
     return UTF8JSONResponse(content=content, status_code=status_code)
@@ -1276,7 +1306,7 @@ async def create_job(body: dict):
 # GET /api/jobs — Bugünün tüm job'larını listele
 # ---------------------------------------------------------------------------
 
-@app.get("/api/jobs")
+@app.get("/api/jobs", dependencies=[Depends(require_api_key)])
 async def list_jobs():
     return UTF8JSONResponse(content=await _list_jobs_data())
 
@@ -1284,7 +1314,7 @@ async def list_jobs():
 # GET /api/jobs/{job_id} — Tek job durumu
 # ---------------------------------------------------------------------------
 
-@app.get("/api/jobs/{job_id}")
+@app.get("/api/jobs/{job_id}", dependencies=[Depends(require_api_key)])
 async def get_job(job_id: str):
     return UTF8JSONResponse(content=await _get_job_detail_data(job_id))
 
@@ -1292,7 +1322,7 @@ async def get_job(job_id: str):
 # GET /api/jobs/{job_id}/result — JSON sonucu indir
 # ---------------------------------------------------------------------------
 
-@app.get("/api/jobs/{job_id}/result")
+@app.get("/api/jobs/{job_id}/result", dependencies=[Depends(require_api_key)])
 async def get_result(job_id: str):
     try:
         _validate_job_id(job_id)
@@ -1315,7 +1345,7 @@ async def get_result(job_id: str):
     return await _build_result_response(rec, inline=False)
 
 
-@app.get("/api/jobs/{job_id}/result/json")
+@app.get("/api/jobs/{job_id}/result/json", dependencies=[Depends(require_api_key)])
 async def get_result_json(job_id: str):
     try:
         _validate_job_id(job_id)

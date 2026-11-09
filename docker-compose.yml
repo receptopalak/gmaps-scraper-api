@@ -42,6 +42,8 @@ services:
       - GOSOM_API_URL=http://gmaps-scraper:8080/api/v1
       - DATA_ROOT=gmapsdata/json
       - REDIS_URL=redis://redis:6379/0
+      # /api/jobs için anahtar(lar); .env'de SCRAPER_API_KEYS=anahtar1,anahtar2
+      - SCRAPER_API_KEYS=${SCRAPER_API_KEYS:-}
     depends_on:
       - gmaps-scraper
       - redis
