@@ -24,7 +24,8 @@ def _row(point, rank, place_id, sponsored=False, **extra):
     row = {"input_id": f"p{point}", "rank": rank if not sponsored else None, "sponsored": sponsored,
            "title": f"Yer {place_id}", "place_id": place_id, "cid": "1", "data_id": "0x1:0x1",
            "review_rating": "4.800000", "review_count": "52", "category": "Fırın",
-           "latitude": "41.0", "longitude": "29.0", "link": "https://maps/x", "user_reviews": None}
+           "latitude": "41.0", "longitude": "29.0", "link": "https://maps/x", "user_reviews": None,
+           "position": str(rank + 1) if rank else "1"}
     row.update(extra)
     return row
 
@@ -68,7 +69,7 @@ class RankScanResultTests(unittest.TestCase):
         self.assertEqual([p["index"] for p in out], [0, 1, 2])
         self.assertEqual([r["place_id"] for r in out[0]["results"]], ["A", "B", "AD"])
         first = out[0]["results"][0]
-        self.assertEqual(first, {"rank": 1, "sponsored": False, "title": "Yer A", "place_id": "A", "cid": "1",
+        self.assertEqual(first, {"rank": 1, "position": 2, "sponsored": False, "title": "Yer A", "place_id": "A", "cid": "1",
                                  "data_id": "0x1:0x1", "rating": 4.8, "review_count": 52, "category": "Fırın",
                                  "lat": 41.0, "lng": 29.0, "link": "https://maps/x"})
         self.assertTrue(out[0]["observed"])

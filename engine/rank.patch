@@ -1,8 +1,8 @@
 diff --git a/gmaps/entry.go b/gmaps/entry.go
-index c8ec562..b204619 100644
+index c8ec562..3638df3 100644
 --- a/gmaps/entry.go
 +++ b/gmaps/entry.go
-@@ -95,6 +95,10 @@ type Entry struct {
+@@ -95,6 +95,12 @@ type Entry struct {
  	UserReviews         []Review               `json:"user_reviews"`
  	UserReviewsExtended []Review               `json:"user_reviews_extended"`
  	Emails              []string               `json:"emails"`
@@ -10,33 +10,37 @@ index c8ec562..b204619 100644
 +	// ya da sponsorlu. Sayfalar paralel işlendiği için satır sırası bunu vermez.
 +	Rank      int  `json:"rank"`
 +	Sponsored bool `json:"sponsored"`
++	// Position: reklamlar dahil listedeki konum (1'den). 0 = bilinmiyor.
++	Position int `json:"position"`
  }
  
  func (e *Entry) haversineDistance(lat, lon float64) float64 {
-@@ -192,6 +196,8 @@ func (e *Entry) CsvHeaders() []string {
+@@ -192,6 +198,9 @@ func (e *Entry) CsvHeaders() []string {
  		"user_reviews",
  		"user_reviews_extended",
  		"emails",
 +		"rank",
 +		"sponsored",
++		"position",
  	}
  }
  
-@@ -231,6 +237,8 @@ func (e *Entry) CsvRow() []string {
+@@ -231,6 +240,9 @@ func (e *Entry) CsvRow() []string {
  		stringify(e.UserReviews),
  		stringify(e.UserReviewsExtended),
  		stringSliceToString(e.Emails),
 +		strconv.Itoa(e.Rank),
 +		strconv.FormatBool(e.Sponsored),
++		strconv.Itoa(e.Position),
  	}
  }
  
 diff --git a/gmaps/feedrank.go b/gmaps/feedrank.go
 new file mode 100644
-index 0000000..32e23f6
+index 0000000..4d50195
 --- /dev/null
 +++ b/gmaps/feedrank.go
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,177 @@
 +package gmaps
 +
 +import (
@@ -145,6 +149,7 @@ index 0000000..32e23f6
 +
 +		card := s.Parent()
 +		e := placeURLEntry(href, jobID)
++		e.Position = len(entries) + 1
 +		e.Rank = 0
 +		e.Sponsored = isSponsoredCard(card)
 +
@@ -176,7 +181,7 @@ index 0000000..32e23f6
 +// placeURLEntry, bir /maps/place/ bağlantısındaki kimlik ve konumu okur.
 +// Arama doğrudan tek bir işletmeye gittiğinde de kullanılır (sıra 1).
 +func placeURLEntry(u, jobID string) *Entry {
-+	e := &Entry{ID: jobID, Link: u, Rank: 1}
++	e := &Entry{ID: jobID, Link: u, Rank: 1, Position: 1}
 +
 +	if i := strings.Index(u, "/maps/place/"); i >= 0 {
 +		name := u[i+len("/maps/place/"):]
@@ -215,10 +220,10 @@ index 0000000..32e23f6
 +}
 diff --git a/gmaps/feedrank_test.go b/gmaps/feedrank_test.go
 new file mode 100644
-index 0000000..cd5d1cc
+index 0000000..50d9d31
 --- /dev/null
 +++ b/gmaps/feedrank_test.go
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,155 @@
 +package gmaps
 +
 +import (
@@ -297,19 +302,16 @@ index 0000000..cd5d1cc
 +}
 +
 +func TestEntryCsvCarriesRank(t *testing.T) {
-+	e := Entry{Rank: 7, Sponsored: false}
++	e := Entry{Rank: 7, Sponsored: false, Position: 9}
 +
 +	headers, row := e.CsvHeaders(), e.CsvRow()
 +	if len(headers) != len(row) {
 +		t.Fatalf("headers %d != row %d", len(headers), len(row))
 +	}
 +
-+	if headers[len(headers)-2] != "rank" || row[len(row)-2] != "7" {
-+		t.Fatalf("rank column = %q/%q", headers[len(headers)-2], row[len(row)-2])
-+	}
-+
-+	if headers[len(headers)-1] != "sponsored" || row[len(row)-1] != "false" {
-+		t.Fatalf("sponsored column = %q/%q", headers[len(headers)-1], row[len(row)-1])
++	n := len(headers)
++	if headers[n-3] != "rank" || row[n-3] != "7" || headers[n-2] != "sponsored" || row[n-2] != "false" || headers[n-1] != "position" || row[n-1] != "9" {
++		t.Fatalf("columns = %v / %v", headers[n-3:], row[n-3:])
 +	}
 +}
 +
@@ -333,6 +335,10 @@ index 0000000..cd5d1cc
 +	got := FeedEntries(doc, "job-1")
 +	if len(got) != 3 {
 +		t.Fatalf("len = %d", len(got))
++	}
++
++	if got[0].Position != 1 || got[1].Position != 2 || got[2].Position != 3 {
++		t.Errorf("positions = %d %d %d", got[0].Position, got[1].Position, got[2].Position)
 +	}
 +
 +	ad := got[0]

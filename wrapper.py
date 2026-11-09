@@ -1176,6 +1176,7 @@ def _num(value, cast):
 def _slim_rank_row(row: dict) -> dict:
     return {
         "rank": row.get("rank"),
+        "position": _num(row.get("position"), int) or None,
         "sponsored": bool(row.get("sponsored")),
         "title": row.get("title"),
         "place_id": row.get("place_id"),
