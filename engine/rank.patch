@@ -1,8 +1,162 @@
+diff --git a/gmaps/dom_reviews_test.go b/gmaps/dom_reviews_test.go
+new file mode 100644
+index 0000000..e87bd24
+--- /dev/null
++++ b/gmaps/dom_reviews_test.go
+@@ -0,0 +1,100 @@
++//nolint:testpackage // we need to test unexported functions in the same package
++package gmaps
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func Test_decodeDOMReviews(t *testing.T) {
++	const reviewID = "ChZDSUhNMG9nS0VJQ0FnSUR2c0tYWVh3EAE"
++
++	tests := []struct {
++		name string
++		raw  map[string]any
++		want DOMReview
++	}{
++		{"int rating", map[string]any{"rating": 5}, DOMReview{Rating: 5}},
++		{"float rating", map[string]any{"rating": 4.0}, DOMReview{Rating: 4}},
++		{"rating above scale", map[string]any{"rating": 12}, DOMReview{}},
++		{"negative rating", map[string]any{"rating": -3}, DOMReview{}},
++		{"string rating", map[string]any{"rating": "5"}, DOMReview{}},
++		{"bool rating", map[string]any{"rating": true}, DOMReview{}},
++		{"nil rating", map[string]any{"rating": nil}, DOMReview{}},
++		{"missing rating", map[string]any{}, DOMReview{}},
++		{"review id", map[string]any{"review_id": reviewID}, DOMReview{ReviewID: reviewID}},
++		{"empty review id", map[string]any{"review_id": ""}, DOMReview{}},
++		{"missing review id", map[string]any{"rating": 3}, DOMReview{Rating: 3}},
++		{
++			"author and relative time",
++			map[string]any{"author_name": "Reviewer A", "relative_time_description": "a year ago"},
++			DOMReview{AuthorName: "Reviewer A", RelativeTimeDescription: "a year ago"},
++		},
++	}
++
++	for i := range tests {
++		tt := tests[i]
++		t.Run(tt.name, func(t *testing.T) {
++			got := decodeDOMReviews([]any{tt.raw})
++			require.Len(t, got, 1)
++			assert.Equal(t, tt.want, got[0])
++		})
++	}
++}
++
++func Test_ConvertDOMReviewsToReviews(t *testing.T) {
++	const reviewID = "ChZDSUhNMG9nS0VJQ0FnSUR2c0tYWVh3EAE"
++
++	got := ConvertDOMReviewsToReviews([]DOMReview{
++		{
++			ReviewID:                reviewID,
++			AuthorName:              "Reviewer A",
++			Rating:                  5,
++			RelativeTimeDescription: "3 months ago",
++		},
++		{Rating: 4},
++	})
++
++	require.Len(t, got, 1)
++	assert.Equal(t, reviewID, got[0].ReviewID)
++	assert.Equal(t, 5, got[0].Rating)
++	assert.Equal(t, "Reviewer A", got[0].Name)
++	assert.Equal(t, "3 months ago", got[0].When)
++}
++
++func Test_dedupeDOMReviewsAgainstPrimary(t *testing.T) {
++	tests := []struct {
++		name    string
++		primary []Review
++		dom     []Review
++		want    []Review
++	}{
++		{
++			"matching id dropped",
++			[]Review{{ReviewID: "id-1"}, {ReviewID: "id-2"}},
++			[]Review{{ReviewID: "id-1"}, {ReviewID: "id-3"}},
++			[]Review{{ReviewID: "id-3"}},
++		},
++		{
++			"unmatched ids kept",
++			[]Review{{ReviewID: "id-1"}},
++			[]Review{{ReviewID: "id-2"}, {ReviewID: "id-3"}},
++			[]Review{{ReviewID: "id-2"}, {ReviewID: "id-3"}},
++		},
++		{
++			"empty ids never match",
++			[]Review{{ReviewID: ""}, {ReviewID: "id-1"}},
++			[]Review{{ReviewID: ""}, {ReviewID: ""}},
++			[]Review{{ReviewID: ""}, {ReviewID: ""}},
++		},
++	}
++
++	for i := range tests {
++		tt := tests[i]
++		t.Run(tt.name, func(t *testing.T) {
++			assert.Equal(t, tt.want, dedupeDOMReviewsAgainstPrimary(tt.primary, tt.dom))
++		})
++	}
++}
 diff --git a/gmaps/entry.go b/gmaps/entry.go
-index c8ec562..4526176 100644
+index c8ec562..370dc52 100644
 --- a/gmaps/entry.go
 +++ b/gmaps/entry.go
-@@ -95,6 +95,12 @@ type Entry struct {
+@@ -4,12 +4,14 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"iter"
++	"log"
+ 	"math"
+ 	"net/url"
+ 	"runtime/debug"
+ 	"slices"
+ 	"strconv"
+ 	"strings"
++	"time"
+ )
+ 
+ type Image struct {
+@@ -55,8 +57,32 @@ type Review struct {
+ 	Description    string
+ 	Images         []string
+ 	When           string
++
++	ReviewID            string  `json:"review_id"`
++	Source              string  `json:"source"`
++	RatingScale         int     `json:"rating_scale"`
++	RatingFloat         float64 `json:"rating_float"`
++	AuthorURL           string  `json:"author_url"`
++	PostedAtUnixMicros  int64   `json:"posted_at_unix_micros"`
++	UpdatedAtUnixMicros int64   `json:"updated_at_unix_micros"`
++	Language            string  `json:"language"`
++	TranslatedLang      string  `json:"translated_lang"`
++	TextOriginal        string  `json:"text_original"`
++	TextTranslated      string  `json:"text_translated"`
++
++	ReplyText                string     `json:"reply_text,omitempty"`
++	ReplyTextOriginal        string     `json:"reply_text_original,omitempty"`
++	ReplyLanguage            string     `json:"reply_language,omitempty"`
++	ReplyTranslatedLang      string     `json:"reply_translated_lang,omitempty"`
++	ReplyPostedAtUnixMicros  int64      `json:"reply_posted_at_unix_micros,omitempty"`
++	ReplyUpdatedAtUnixMicros int64      `json:"reply_updated_at_unix_micros,omitempty"`
++	PublishedAt              *time.Time `json:"published_at,omitempty"`
+ }
+ 
++const reviewPublishedAtFutureSkew = 24 * time.Hour
++
++var earliestReviewPublishedAt = time.Date(2007, time.January, 1, 0, 0, 0, 0, time.UTC)
++
+ type Entry struct {
+ 	ID         string              `json:"input_id"`
+ 	Link       string              `json:"link"`
+@@ -95,6 +121,12 @@ type Entry struct {
  	UserReviews         []Review               `json:"user_reviews"`
  	UserReviewsExtended []Review               `json:"user_reviews_extended"`
  	Emails              []string               `json:"emails"`
@@ -15,7 +169,7 @@ index c8ec562..4526176 100644
  }
  
  func (e *Entry) haversineDistance(lat, lon float64) float64 {
-@@ -192,6 +198,10 @@ func (e *Entry) CsvHeaders() []string {
+@@ -192,6 +224,10 @@ func (e *Entry) CsvHeaders() []string {
  		"user_reviews",
  		"user_reviews_extended",
  		"emails",
@@ -26,7 +180,7 @@ index c8ec562..4526176 100644
  	}
  }
  
-@@ -231,6 +241,10 @@ func (e *Entry) CsvRow() []string {
+@@ -231,6 +267,10 @@ func (e *Entry) CsvRow() []string {
  		stringify(e.UserReviews),
  		stringify(e.UserReviewsExtended),
  		stringSliceToString(e.Emails),
@@ -37,6 +191,418 @@ index c8ec562..4526176 100644
  	}
  }
  
+@@ -258,11 +298,12 @@ func extractReviews(data []byte) []Review {
+ 
+ 	var jd []any
+ 	if err := json.Unmarshal(data, &jd); err != nil {
+-		fmt.Printf("Error unmarshalling RPC JSON: %v (data len: %d)\n", err, len(data))
++		log.Printf("DEBUG: Error unmarshalling RPC JSON: %v (data len: %d)", err, len(data))
+ 		return nil
+ 	}
+ 
+ 	if len(jd) < 3 {
++		log.Printf("DEBUG: RPC response has only %d elements, expected 3+", len(jd))
+ 		return nil
+ 	}
+ 
+@@ -465,76 +506,72 @@ func parseReviews(reviewsI []any) []Review {
+ 			}
+ 		}
+ 
+-		// Try multiple paths for the timestamp
+-		time := getNthElementAndCast[[]any](el, 2, 2, 0, 1, 21, 6, 8)
+-		if len(time) == 0 {
+-			time = getNthElementAndCast[[]any](el, 2, 2, 0, 1, 6, 8)
++		review := Review{
++			Name:           reviewAuthorName(el),
++			ProfilePicture: reviewProfilePicture(el),
++			When:           reviewRelativeDate(el),
++			PublishedAt:    reviewPublishedAt(el),
++			Rating:         reviewRating(el),
++			Description:    reviewDescription(el),
+ 		}
+ 
+-		// Try multiple paths for profile picture
+-		profilePic, err := decodeURL(getNthElementAndCast[string](el, 1, 4, 5, 1))
+-		if err != nil || profilePic == "" {
+-			profilePic = getNthElementAndCast[string](el, 1, 2, 0)
+-			if profilePic == "" {
+-				profilePic = getNthElementAndCast[string](el, 0, 2, 0)
+-			}
+-		}
++		// Extended metadata
++		review.ReviewID = getNthElementAndCast[string](el, 0)
++		review.PostedAtUnixMicros = int64(getNthElementAndCast[float64](el, 1, 2))
++		review.UpdatedAtUnixMicros = int64(getNthElementAndCast[float64](el, 1, 3))
++		review.AuthorURL = getNthElementAndCast[string](el, 1, 4, 2, 0)
+ 
+-		// Try multiple paths for author name
+-		authorName := getNthElementAndCast[string](el, 1, 4, 5, 0)
+-		if authorName == "" {
+-			authorName = getNthElementAndCast[string](el, 1, 4, 4)
+-			if authorName == "" {
+-				authorName = getNthElementAndCast[string](el, 0, 1)
+-			}
++		src := getNthElementAndCast[string](el, 1, 13, 0)
++		if src == "" {
++			src = "unknown"
+ 		}
+ 
+-		// Try multiple paths for rating
+-		rating := int(getNthElementAndCast[float64](el, 2, 0, 0))
+-		if rating == 0 {
+-			rating = int(getNthElementAndCast[float64](el, 2, 0))
+-			if rating == 0 {
+-				rating = int(getNthElementAndCast[float64](el, 1, 0, 0))
+-			}
+-		}
++		review.Source = src
+ 
+-		// Try multiple paths for description
+-		description := getNthElementAndCast[string](el, 2, 15, 0, 0)
+-		if description == "" {
+-			description = getNthElementAndCast[string](el, 2, 15, 0)
+-			if description == "" {
+-				description = getNthElementAndCast[string](el, 3, 0)
+-			}
++		scale := int(getNthElementAndCast[float64](el, 1, 13, 4))
++		if scale == 0 {
++			scale = 5
+ 		}
+ 
+-		review := Review{
+-			Name:           authorName,
+-			ProfilePicture: profilePic,
+-			When: func() string {
+-				if len(time) < 3 {
+-					return ""
+-				}
++		review.RatingScale = scale
+ 
+-				return fmt.Sprintf("%v-%v-%v", time[0], time[1], time[2])
+-			}(),
+-			Rating:      rating,
+-			Description: description,
++		review.Language = getNthElementAndCast[string](el, 2, 14, 0)
++		review.TranslatedLang = getNthElementAndCast[string](el, 2, 14, 1)
++		review.TextOriginal = getNthElementAndCast[string](el, 2, 15, 0, 0)
++		review.TextTranslated = getNthElementAndCast[string](el, 2, 15, 1, 0)
++
++		r2 := getNthElementAndCast[[]any](el, 2)
++
++		isAggregator := len(r2) > 0 && r2[0] == nil
++		if isAggregator {
++			review.RatingFloat = getNthElementAndCast[float64](el, 2, 8, 1)
++		} else {
++			review.RatingFloat = float64(review.Rating)
+ 		}
+ 
+-		if review.Name == "" {
+-			continue
++		r3 := getNthElementAndCast[[]any](el, 3)
++		if len(r3) >= 15 && r3[1] != nil {
++			review.ReplyPostedAtUnixMicros = int64(getNthElementAndCast[float64](el, 3, 1))
++			review.ReplyUpdatedAtUnixMicros = int64(getNthElementAndCast[float64](el, 3, 2))
++			review.ReplyLanguage = getNthElementAndCast[string](el, 3, 13, 0)
++			review.ReplyTranslatedLang = getNthElementAndCast[string](el, 3, 13, 1)
++			review.ReplyTextOriginal = getNthElementAndCast[string](el, 3, 14, 0, 0)
++			review.ReplyText = getNthElementAndCast[string](el, 3, 14, 1, 0)
+ 		}
+ 
+-		// Try multiple paths for images
+-		optsI := getNthElementAndCast[[]any](el, 2, 2, 0, 1, 21, 7)
+-		if len(optsI) == 0 {
+-			optsI = getNthElementAndCast[[]any](el, 2, 2, 0, 1, 7)
++		if review.Name == "" {
++			continue
+ 		}
+ 
+-		for j := range optsI {
+-			val := getNthElementAndCast[string](optsI, j)
+-			if val != "" && len(val) > 2 {
+-				review.Images = append(review.Images, val[2:])
++		// Extract user-contributed photo URLs for this review.
++		// Structure: el[2][2] is the image list; each image's direct lh3 URL lives at [1][6][0].
++		// The previous paths (e.g. [2][2][0][1][21][7]) landed on the imagery/report
++		// "report this photo" URL, not the actual hosted image. See issue #240.
++		imgs := getNthElementAndCast[[]any](el, 2, 2)
++		for j := range imgs {
++			url := getNthElementAndCast[string](imgs, j, 1, 6, 0)
++			if url != "" {
++				review.Images = append(review.Images, url)
+ 			}
+ 		}
+ 
+@@ -544,6 +581,91 @@ func parseReviews(reviewsI []any) []Review {
+ 	return ans
+ }
+ 
++func firstNonEmpty(values ...string) string {
++	for _, value := range values {
++		if value != "" {
++			return value
++		}
++	}
++
++	return ""
++}
++
++func reviewRelativeDate(el []any) string {
++	return firstNonEmpty(
++		getNthElementAndCast[string](el, 1, 6),
++		getNthElementAndCast[string](el, 3, 3),
++		getNthElementAndCast[string](el, 2, 1, 3, 8, 0),
++	)
++}
++
++func reviewPublishedAt(el []any) *time.Time {
++	timestampMicros := firstNonZero(
++		getNthElementAndCast[float64](el, 1, 2),
++		getNthElementAndCast[float64](el, 1, 3),
++	)
++	if timestampMicros == 0 {
++		return nil
++	}
++
++	publishedAt := time.UnixMicro(int64(timestampMicros)).UTC()
++	if publishedAt.Before(earliestReviewPublishedAt) {
++		return nil
++	}
++
++	if publishedAt.After(time.Now().UTC().Add(reviewPublishedAtFutureSkew)) {
++		return nil
++	}
++
++	return &publishedAt
++}
++
++func reviewProfilePicture(el []any) string {
++	profilePic, err := decodeURL(getNthElementAndCast[string](el, 1, 4, 5, 1))
++	if err == nil && profilePic != "" {
++		return profilePic
++	}
++
++	return firstNonEmpty(
++		getNthElementAndCast[string](el, 1, 2, 0),
++		getNthElementAndCast[string](el, 0, 2, 0),
++	)
++}
++
++func reviewAuthorName(el []any) string {
++	return firstNonEmpty(
++		getNthElementAndCast[string](el, 1, 4, 5, 0),
++		getNthElementAndCast[string](el, 1, 4, 4),
++		getNthElementAndCast[string](el, 0, 1),
++	)
++}
++
++func reviewRating(el []any) int {
++	return int(firstNonZero(
++		getNthElementAndCast[float64](el, 2, 0, 0),
++		getNthElementAndCast[float64](el, 2, 0),
++		getNthElementAndCast[float64](el, 1, 0, 0),
++	))
++}
++
++func firstNonZero(values ...float64) float64 {
++	for _, value := range values {
++		if value != 0 {
++			return value
++		}
++	}
++
++	return 0
++}
++
++func reviewDescription(el []any) string {
++	return firstNonEmpty(
++		getNthElementAndCast[string](el, 2, 15, 0, 0),
++		getNthElementAndCast[string](el, 2, 15, 0),
++		getNthElementAndCast[string](el, 3, 0),
++	)
++}
++
+ type getLinkSourceParams struct {
+ 	arr    []any
+ 	source []int
+diff --git a/gmaps/entry_internal_test.go b/gmaps/entry_internal_test.go
+new file mode 100644
+index 0000000..b570a3f
+--- /dev/null
++++ b/gmaps/entry_internal_test.go
+@@ -0,0 +1,172 @@
++package gmaps
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestParseReviewsRelativeDatePaths(t *testing.T) {
++	tests := []struct {
++		name    string
++		wrapped bool
++		path    []int
++		when    string
++	}{
++		{
++			name:    "inline review metadata path",
++			wrapped: true,
++			path:    []int{1, 6},
++			when:    "7 months ago",
++		},
++		{
++			name: "direct review fallback path",
++			path: []int{3, 3},
++			when: "3 weeks ago",
++		},
++		{
++			name: "nested review rpc path",
++			path: []int{2, 1, 3, 8, 0},
++			when: "4 years ago",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			review := newReviewElement()
++			setNested(review, tt.when, tt.path...)
++
++			item := any(review)
++			if tt.wrapped {
++				item = []any{review}
++			}
++
++			reviews := parseReviews([]any{item})
++
++			require.Len(t, reviews, 1)
++			require.Equal(t, tt.when, reviews[0].When)
++			require.Equal(t, "Ada Lovelace", reviews[0].Name)
++			require.Equal(t, 5, reviews[0].Rating)
++			require.Equal(t, "Clear review text", reviews[0].Description)
++		})
++	}
++}
++
++func TestParseReviewsPublishedAtFromMicrosecondTimestamp(t *testing.T) {
++	review := newReviewElement()
++	setNested(review, "6 months ago", 1, 6)
++	setNested(review, 1764184138462529.0, 1, 2)
++
++	reviews := parseReviews([]any{review})
++
++	require.Len(t, reviews, 1)
++	require.NotNil(t, reviews[0].PublishedAt)
++	require.Equal(t, "2025-11-26T19:08:58.462529Z", reviews[0].PublishedAt.Format(time.RFC3339Nano))
++}
++
++func TestParseReviewsPublishedAtFallsBackToSecondTimestampPath(t *testing.T) {
++	review := newReviewElement()
++	setNested(review, "6 months ago", 1, 6)
++	setNested(review, 1764184138462529.0, 1, 3)
++
++	reviews := parseReviews([]any{review})
++
++	require.Len(t, reviews, 1)
++	require.NotNil(t, reviews[0].PublishedAt)
++	require.Equal(t, "2025-11-26T19:08:58.462529Z", reviews[0].PublishedAt.Format(time.RFC3339Nano))
++}
++
++func TestParseReviewsPublishedAtRejectsInvalidTimestamps(t *testing.T) {
++	tests := []struct {
++		name   string
++		micros float64
++	}{
++		{
++			name: "missing",
++		},
++		{
++			name:   "before lower bound",
++			micros: float64(time.Date(2006, time.December, 31, 23, 59, 59, 0, time.UTC).UnixMicro()),
++		},
++		{
++			name:   "too far in future",
++			micros: float64(time.Now().UTC().Add(48 * time.Hour).UnixMicro()),
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			review := newReviewElement()
++			setNested(review, "6 months ago", 1, 6)
++
++			if tt.micros != 0 {
++				setNested(review, tt.micros, 1, 2)
++			}
++
++			reviews := parseReviews([]any{review})
++
++			require.Len(t, reviews, 1)
++			require.Nil(t, reviews[0].PublishedAt)
++		})
++	}
++}
++
++func TestParseReviewsSkipsItemsWithoutAuthor(t *testing.T) {
++	review := make([]any, 4)
++	setNested(review, "yesterday", 1, 6)
++	setNested(review, 5.0, 2, 0, 0)
++
++	reviews := parseReviews([]any{review})
++
++	require.Empty(t, reviews)
++}
++
++func newReviewElement() []any {
++	review := make([]any, 4)
++
++	setNested(review, "Ada Lovelace", 1, 4, 5, 0)
++	setNested(review, 5.0, 2, 0, 0)
++	setNested(review, "Clear review text", 2, 15, 0, 0)
++
++	return review
++}
++
++func setNested(root []any, value any, path ...int) {
++	setNestedValue(root, value, path...)
++}
++
++func setNestedValue(current []any, value any, path ...int) []any {
++	if len(path) == 0 {
++		return current
++	}
++
++	index := path[0]
++	current = ensureLen(current, index+1)
++
++	if len(path) == 1 {
++		current[index] = value
++
++		return current
++	}
++
++	next, ok := current[index].([]any)
++	if !ok {
++		next = make([]any, path[1]+1)
++	}
++
++	current[index] = setNestedValue(next, value, path[1:]...)
++
++	return current
++}
++
++func ensureLen(items []any, length int) []any {
++	if len(items) >= length {
++		return items
++	}
++
++	extended := make([]any, length)
++	copy(extended, items)
++
++	return extended
++}
 diff --git a/gmaps/feedrank.go b/gmaps/feedrank.go
 new file mode 100644
 index 0000000..4d50195
@@ -492,10 +1058,18 @@ index 198c263..b9d4db0 100644
  
  	if j.ExitMonitor != nil {
 diff --git a/gmaps/place.go b/gmaps/place.go
-index 21fa66e..f157455 100644
+index 21fa66e..c377676 100644
 --- a/gmaps/place.go
 +++ b/gmaps/place.go
-@@ -22,6 +22,11 @@ type PlaceJob struct {
+@@ -3,6 +3,7 @@ package gmaps
+ import (
+ 	"context"
+ 	"fmt"
++	"log"
+ 	"strings"
+ 	"time"
+ 
+@@ -22,6 +23,11 @@ type PlaceJob struct {
  	ExitMonitor             exiter.Exiter
  	ExtractExtraReviews     bool
  	WriterManagedCompletion bool
@@ -507,7 +1081,7 @@ index 21fa66e..f157455 100644
  }
  
  func NewPlaceJob(parentID, langCode, u string, extractEmail, extraExtraReviews bool, opts ...PlaceJobOptions) *PlaceJob {
-@@ -65,6 +70,14 @@ func WithPlaceJobWriterManagedCompletion() PlaceJobOptions {
+@@ -65,6 +71,14 @@ func WithPlaceJobWriterManagedCompletion() PlaceJobOptions {
  	}
  }
  
@@ -522,7 +1096,7 @@ index 21fa66e..f157455 100644
  func (j *PlaceJob) ProcessOnFetchError() bool {
  	return true
  }
-@@ -103,6 +116,8 @@ func (j *PlaceJob) Process(_ context.Context, resp *scrapemate.Response) (any, [
+@@ -103,6 +117,8 @@ func (j *PlaceJob) Process(_ context.Context, resp *scrapemate.Response) (any, [
  	}
  
  	entry.ID = j.ParentID
@@ -531,7 +1105,23 @@ index 21fa66e..f157455 100644
  
  	if entry.Link == "" {
  		entry.Link = j.GetURL()
-@@ -179,6 +194,9 @@ func (j *PlaceJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPa
+@@ -118,7 +134,14 @@ func (j *PlaceJob) Process(_ context.Context, resp *scrapemate.Response) (any, [
+ 	domReviews, ok := resp.Meta["dom_reviews"].([]DOMReview)
+ 	if ok && len(domReviews) > 0 {
+ 		convertedReviews := ConvertDOMReviewsToReviews(domReviews)
+-		entry.UserReviewsExtended = append(entry.UserReviewsExtended, convertedReviews...)
++
++		deduped := dedupeDOMReviewsAgainstPrimary(entry.UserReviews, convertedReviews)
++		if len(deduped) != len(convertedReviews) {
++			log.Printf("DOM reviews: dropped %d of %d already present in user_reviews",
++				len(convertedReviews)-len(deduped), len(convertedReviews))
++		}
++
++		entry.UserReviewsExtended = append(entry.UserReviewsExtended, deduped...)
+ 	}
+ 
+ 	if j.ExtractEmail && entry.IsWebsiteValidForEmail() {
+@@ -179,10 +202,13 @@ func (j *PlaceJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPa
  
  	if j.ExtractExtraReviews {
  		reviewCount := j.getReviewCount(raw)
@@ -541,6 +1131,40 @@ index 21fa66e..f157455 100644
  		if reviewCount > 0 { // download reviews for any place that has them
  			params := fetchReviewsParams{
  				page:        page,
+-				mapURL:      page.URL(),
++				mapURL:      reviewMapURL(page.URL(), j.getDataID(raw)),
+ 				reviewCount: reviewCount,
+ 			}
+ 
+@@ -281,6 +307,28 @@ func (j *PlaceJob) extractJSON(page scrapemate.BrowserPage) ([]byte, error) {
+ 	return nil, fmt.Errorf("APP_INITIALIZATION_STATE data not found after retries")
+ }
+ 
++func (j *PlaceJob) getDataID(data []byte) string {
++	// Tam ayrıştırma: "yalnız yorum sayısı" kipi data_id'yi okumaz.
++	tmpEntry, err := EntryFromJSON(data)
++	if err != nil {
++		return ""
++	}
++
++	return tmpEntry.DataID
++}
++
++// reviewMapURL: yorum RPC'si adresteki "!1s<data_id>" kimliğini kullanır.
++// place_id ile açılan sayfanın adresinde bu kimlik yoktur; o zaman sayfa
++// verisindeki data_id ile kimliği taşıyan bir adres kurulur. Aksi halde RPC
++// hiç denenmez ve yalnız sayfada görünen birkaç yorum okunabilir.
++func reviewMapURL(pageURL, dataID string) string {
++	if strings.Contains(pageURL, "!1s") || dataID == "" {
++		return pageURL
++	}
++
++	return "https://www.google.com/maps/place/data=!4m2!3m1!1s" + dataID
++}
++
+ func (j *PlaceJob) getReviewCount(data []byte) int {
+ 	tmpEntry, err := EntryFromJSON(data, true)
+ 	if err != nil {
 diff --git a/gmaps/rankgrid.go b/gmaps/rankgrid.go
 new file mode 100644
 index 0000000..a4a499f
@@ -670,8 +1294,35 @@ index 0000000..34922d5
 +		t.Fatal("sınır yokken sayfalama durmamalı")
 +	}
 +}
+diff --git a/gmaps/review_url_test.go b/gmaps/review_url_test.go
+new file mode 100644
+index 0000000..689237e
+--- /dev/null
++++ b/gmaps/review_url_test.go
+@@ -0,0 +1,21 @@
++package gmaps
++
++import "testing"
++
++func TestReviewMapURLUsesDataIDWhenPageHasNone(t *testing.T) {
++	got := reviewMapURL("https://www.google.com/maps/place/?q=place_id:ChIJY3xO2pbHyhQR3pDmWa-xllI", "0x14cac796da4e7c63:0x5296b1af59e690de")
++	id, err := extractPlaceID(got)
++	if err != nil || id != "0x14cac796da4e7c63:0x5296b1af59e690de" {
++		t.Fatalf("url=%s id=%s err=%v", got, id, err)
++	}
++
++	keep := "https://www.google.com/maps/place/X/data=!4m2!3m1!1s0xabc:0xdef"
++	if reviewMapURL(keep, "0x1:0x2") != keep {
++		t.Fatal("a page URL that already carries the id must be kept")
++	}
++
++	plain := "https://www.google.com/maps/place/?q=place_id:Y"
++	if reviewMapURL(plain, "") != plain {
++		t.Fatal("without a data id the page URL is kept")
++	}
++}
 diff --git a/gmaps/reviews.go b/gmaps/reviews.go
-index 7a8b737..2e65ca7 100644
+index 7a8b737..be980e4 100644
 --- a/gmaps/reviews.go
 +++ b/gmaps/reviews.go
 @@ -76,7 +76,7 @@ func (f *fetcher) fetch(ctx context.Context) (FetchReviewsResponse, error) {
@@ -713,6 +1364,428 @@ index 7a8b737..2e65ca7 100644
  		// Try multiple patterns for extracting place ID
  		avail := []string{
  			`!1s([^!]+)`,                             // Standard format: !1s0x...
+@@ -323,6 +330,7 @@ func generateRandomID(length int) (string, error) {
+ 
+ // DOMReview represents a review extracted from the DOM
+ type DOMReview struct {
++	ReviewID                string
+ 	AuthorName              string
+ 	AuthorURL               string
+ 	ProfilePicture          string
+@@ -336,7 +344,8 @@ type DOMReview struct {
+ func ConvertDOMReviewsToReviews(domReviews []DOMReview) []Review {
+ 	reviews := make([]Review, 0, len(domReviews))
+ 
+-	for _, dr := range domReviews {
++	for i := range domReviews {
++		dr := &domReviews[i]
+ 		review := Review{
+ 			Name:           dr.AuthorName,
+ 			ProfilePicture: dr.ProfilePicture,
+@@ -344,7 +353,9 @@ func ConvertDOMReviewsToReviews(domReviews []DOMReview) []Review {
+ 			Description:    dr.Text,
+ 			When:           dr.RelativeTimeDescription,
+ 			Images:         dr.Images,
++			ReviewID:       dr.ReviewID,
+ 		}
++
+ 		if review.Name != "" {
+ 			reviews = append(reviews, review)
+ 		}
+@@ -353,6 +364,104 @@ func ConvertDOMReviewsToReviews(domReviews []DOMReview) []Review {
+ 	return reviews
+ }
+ 
++// dedupeDOMReviewsAgainstPrimary drops DOM reviews that are already present in the
++// primary reviews. Matching is by review id only, an empty id is never a duplicate.
++func dedupeDOMReviewsAgainstPrimary(primary, domReviews []Review) []Review {
++	seen := make(map[string]struct{}, len(primary))
++
++	for i := range primary {
++		if primary[i].ReviewID != "" {
++			seen[primary[i].ReviewID] = struct{}{}
++		}
++	}
++
++	if len(seen) == 0 {
++		return domReviews
++	}
++
++	kept := make([]Review, 0, len(domReviews))
++	withID := 0
++
++	for i := range domReviews {
++		if domReviews[i].ReviewID != "" {
++			withID++
++
++			if _, dup := seen[domReviews[i].ReviewID]; dup {
++				continue
++			}
++		}
++
++		kept = append(kept, domReviews[i])
++	}
++
++	if withID > 0 && len(kept) == len(domReviews) {
++		log.Printf("DOM review ids matched none of %d primary ids", len(seen))
++	}
++
++	return kept
++}
++
++func decodeDOMReviews(raw []any) []DOMReview {
++	decoded := make([]DOMReview, 0, len(raw))
++
++	for _, rawReview := range raw {
++		reviewMap, ok := rawReview.(map[string]interface{})
++		if !ok {
++			continue
++		}
++
++		review := DOMReview{}
++		if v, ok := reviewMap["review_id"].(string); ok {
++			review.ReviewID = v
++		}
++
++		if v, ok := reviewMap["author_name"].(string); ok {
++			review.AuthorName = v
++		}
++
++		if v, ok := reviewMap["author_url"].(string); ok {
++			review.AuthorURL = v
++		}
++
++		if v, ok := reviewMap["profile_picture"].(string); ok {
++			review.ProfilePicture = v
++		}
++
++		// Playwright decodes whole JS numbers as int, fractional ones as float64.
++		switch v := reviewMap["rating"].(type) {
++		case int:
++			review.Rating = v
++		case float64:
++			review.Rating = int(v)
++		}
++
++		// The rating selectors also match non-star aria-labels, e.g. "12 reviews".
++		if review.Rating < 1 || review.Rating > 5 {
++			review.Rating = 0
++		}
++
++		if v, ok := reviewMap["relative_time_description"].(string); ok {
++			review.RelativeTimeDescription = v
++		}
++
++		if v, ok := reviewMap["text"].(string); ok {
++			review.Text = v
++		}
++
++		if v, ok := reviewMap["images"].([]interface{}); ok {
++			for _, img := range v {
++				if imgStr, ok := img.(string); ok {
++					review.Images = append(review.Images, imgStr)
++				}
++			}
++		}
++
++		decoded = append(decoded, review)
++	}
++
++	return decoded
++}
++
+ // extractReviewsFromPage extracts reviews directly from the page DOM
+ // This is a fallback when the RPC API fails
+ func extractReviewsFromPage(ctx context.Context, page scrapemate.BrowserPage) ([]DOMReview, error) {
+@@ -467,6 +576,10 @@ func extractReviewsFromPage(ctx context.Context, page scrapemate.BrowserPage) ([
+ 
+ 				for (const element of reviewElements) {
+ 					try {
++						// The card carries the id, unless the selector matched a wrapper
++						const reviewId = element.getAttribute('data-review-id') ||
++							element.querySelector('[data-review-id]')?.getAttribute('data-review-id') || '';
++
+ 						// Author name - comprehensive selectors
+ 						const userSelectors = [
+ 							'.d4r55',           // Primary name class
+@@ -585,6 +698,7 @@ func extractReviewsFromPage(ctx context.Context, page scrapemate.BrowserPage) ([
+ 
+ 						if (userName && (text || rating > 0)) {
+ 							reviews.push({
++								review_id: reviewId,
+ 								author_name: userName,
+ 								author_url: userUrl,
+ 								profile_picture: profilePic,
+@@ -611,65 +725,29 @@ func extractReviewsFromPage(ctx context.Context, page scrapemate.BrowserPage) ([
+ 		} else if reviewsJSON != nil {
+ 			rawReviews, ok := reviewsJSON.([]any)
+ 			if ok {
+-				for _, rawReview := range rawReviews {
+-					reviewMap, ok := rawReview.(map[string]interface{})
+-					if !ok {
+-						continue
+-					}
+-
+-					review := DOMReview{}
+-					if v, ok := reviewMap["author_name"].(string); ok {
+-						review.AuthorName = v
+-					}
+-
+-					if v, ok := reviewMap["author_url"].(string); ok {
+-						review.AuthorURL = v
+-					}
+-
+-					if v, ok := reviewMap["profile_picture"].(string); ok {
+-						review.ProfilePicture = v
+-					}
+-
+-					if v, ok := reviewMap["rating"].(float64); ok {
+-						review.Rating = int(v)
+-					}
+-
+-					if v, ok := reviewMap["relative_time_description"].(string); ok {
+-						review.RelativeTimeDescription = v
+-					}
+-
+-					if v, ok := reviewMap["text"].(string); ok {
+-						review.Text = v
+-					}
+-
+-					if v, ok := reviewMap["images"].([]interface{}); ok {
+-						for _, img := range v {
+-							if imgStr, ok := img.(string); ok {
+-								review.Images = append(review.Images, imgStr)
+-							}
+-						}
+-					}
++				decoded := decodeDOMReviews(rawReviews)
+ 
++				for i := range decoded {
+ 					// Add if unique (check by author name and text prefix)
+ 					isDuplicate := false
+ 
+-					for _, existing := range reviews {
+-						if existing.AuthorName == review.AuthorName {
+-							if existing.Text == review.Text {
++					for j := range reviews {
++						if reviews[j].AuthorName == decoded[i].AuthorName {
++							if reviews[j].Text == decoded[i].Text {
+ 								isDuplicate = true
+ 								break
+ 							}
+ 
+-							if len(existing.Text) > 20 && len(review.Text) > 20 &&
+-								existing.Text[:20] == review.Text[:20] {
++							if len(reviews[j].Text) > 20 && len(decoded[i].Text) > 20 &&
++								reviews[j].Text[:20] == decoded[i].Text[:20] {
+ 								isDuplicate = true
+ 								break
+ 							}
+ 						}
+ 					}
+ 
+-					if !isDuplicate && review.AuthorName != "" {
+-						reviews = append(reviews, review)
++					if !isDuplicate && decoded[i].AuthorName != "" {
++						reviews = append(reviews, decoded[i])
+ 					}
+ 				}
+ 			}
+diff --git a/gmaps/reviews_test.go b/gmaps/reviews_test.go
+new file mode 100644
+index 0000000..30b13fc
+--- /dev/null
++++ b/gmaps/reviews_test.go
+@@ -0,0 +1,157 @@
++//nolint:testpackage // we need to test unexported functions in the same package
++package gmaps
++
++import (
++	"encoding/json"
++	"os"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func Test_extractPlaceID(t *testing.T) {
++	tests := []struct {
++		name    string
++		url     string
++		want    string
++		wantErr bool
++	}{
++		{
++			name:    "standard hex format with exclamation prefix",
++			url:     "https://www.google.com/maps/place/Joe's+Pizza+Broadway/@40.7546795,-73.9870291,17z/data=!4m7!3m6!1s0x89c259ab3c1ef289:0x3b67a41175949f55!8m2!3d40.7546795!4d-73.9870291!16s%2Fg%2F11bw4ws2mt?hl=en&entry=ttu",
++			want:    "0x89c259ab3c1ef289:0x3b67a41175949f55",
++			wantErr: false,
++		},
++		{
++			name:    "place_id query parameter format",
++			url:     "https://www.google.com/maps/place/Joe's+Pizza/@40.7546795,-73.9870291,17z?place_id=ChIJDdnwdv0y5xQRRytw1ihZQeU&hl=en",
++			want:    "ChIJDdnwdv0y5xQRRytw1ihZQeU",
++			wantErr: false,
++		},
++		{
++			name:    "full place URL with data and hex ID",
++			url:     "https://www.google.com/maps/place/Coffee+Project+New+York/data=!4m7!3m6!1s0x89c2599b5a24d7fd:0x9e354f6cf514b9fc!8m2!3d40.7270884!4d-73.989382!16s%2Fg%2F11c3svpqld!19sChIJ_dckWptZwokR_LkU9WxPNZ4",
++			want:    "0x89c2599b5a24d7fd:0x9e354f6cf514b9fc",
++			wantErr: false,
++		},
++		{
++			name:    "maps search URL (no place ID)",
++			url:     "https://www.google.com/maps/search/pizza+in+Brooklyn+NY",
++			want:    "",
++			wantErr: true,
++		},
++		{
++			name:    "empty URL",
++			url:     "",
++			want:    "",
++			wantErr: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got, err := extractPlaceID(tt.url)
++			if (err != nil) != tt.wantErr {
++				t.Errorf("extractPlaceID() error = %v, wantErr %v", err, tt.wantErr)
++				return
++			}
++
++			assert.Equal(t, tt.want, got, "extractPlaceID() = %v, want %v", got, tt.want)
++		})
++	}
++}
++
++func loadReviewsFixture(t *testing.T, filename string) []Review {
++	t.Helper()
++
++	raw, err := os.ReadFile("testdata/" + filename)
++	require.NoError(t, err)
++
++	var reviewsI []any
++
++	require.NoError(t, json.Unmarshal(raw, &reviewsI))
++
++	return parseReviews(reviewsI)
++}
++
++func Test_parseReviews_NativeWithReply(t *testing.T) {
++	reviews := loadReviewsFixture(t, "review_native_with_reply.json")
++	require.Len(t, reviews, 1)
++
++	r := reviews[0]
++	assert.Equal(t, "Ci9DQUlRQUNvZENodHljRjlvT2xGMmRraFdhSFowWW0xWVNURTBObEptU3pWWVgxRRAB", r.ReviewID)
++	assert.Equal(t, "Google", r.Source)
++	assert.Equal(t, 5, r.RatingScale)
++	assert.Equal(t, 1, r.Rating)
++	assert.Equal(t, 1.0, r.RatingFloat)
++	assert.Equal(t, int64(1772186522193853), r.PostedAtUnixMicros)
++	assert.Equal(t, int64(1772186522193853), r.UpdatedAtUnixMicros)
++	assert.Equal(t, "https://www.google.com/maps/contrib/116111130377271376564/reviews?hl=en", r.AuthorURL)
++	assert.Equal(t, "de", r.Language)
++	assert.Equal(t, "en", r.TranslatedLang)
++	assert.NotEmpty(t, r.TextOriginal)
++	assert.NotEmpty(t, r.TextTranslated)
++	assert.NotEmpty(t, r.ReplyTextOriginal)
++	assert.NotEmpty(t, r.ReplyText)
++	assert.Equal(t, int64(1772266947000000), r.ReplyPostedAtUnixMicros)
++	assert.Equal(t, int64(1772266947000000), r.ReplyUpdatedAtUnixMicros)
++	assert.Equal(t, "de", r.ReplyLanguage)
++	// Backward-compat: existing fields unchanged
++	assert.Equal(t, "E. Ö.", r.Name)
++	assert.NotEmpty(t, r.Description)
++	assert.Equal(t, r.TextOriginal, r.Description)
++}
++
++func Test_parseReviews_Aggregator(t *testing.T) {
++	reviews := loadReviewsFixture(t, "review_aggregator.json")
++	require.Len(t, reviews, 1)
++
++	r := reviews[0]
++	assert.Equal(t, "AGG_REVIEW_ID_001", r.ReviewID)
++	assert.Equal(t, "Tripadvisor", r.Source)
++	assert.Equal(t, 10, r.RatingScale)
++	assert.Equal(t, 0, r.Rating)
++	assert.Equal(t, 8.5, r.RatingFloat)
++	assert.Equal(t, int64(1700000000000000), r.PostedAtUnixMicros)
++	assert.Equal(t, int64(1700001000000000), r.UpdatedAtUnixMicros)
++	assert.Equal(t, "https://www.tripadvisor.com/members/testuser", r.AuthorURL)
++	assert.Equal(t, "de", r.Language)
++	assert.Empty(t, r.TranslatedLang)
++	assert.NotEmpty(t, r.TextOriginal)
++	assert.Empty(t, r.TextTranslated)
++	// No reply
++	assert.Equal(t, int64(0), r.ReplyPostedAtUnixMicros)
++	assert.Empty(t, r.ReplyTextOriginal)
++}
++
++func Test_parseReviews_NoText(t *testing.T) {
++	reviews := loadReviewsFixture(t, "review_native_no_text.json")
++	require.Len(t, reviews, 1)
++
++	r := reviews[0]
++	assert.Equal(t, "Ci9DQUlRQUNvZENodHljRjlvT21jMmJ6UnpkemN6Y0dscE9YRndaUzFuVVhCSVprRRAB", r.ReviewID)
++	assert.Equal(t, "Google", r.Source)
++	assert.Equal(t, 5, r.Rating)
++	assert.Equal(t, 5.0, r.RatingFloat)
++	assert.Empty(t, r.TextOriginal)
++	assert.Empty(t, r.TextTranslated)
++	assert.Empty(t, r.Language)
++	assert.Empty(t, r.ReplyTextOriginal)
++	assert.Equal(t, "Lysann Lieblang", r.Name)
++}
++
++func Test_parseReviews_NativeNoTranslation(t *testing.T) {
++	reviews := loadReviewsFixture(t, "review_native_no_translation.json")
++	require.Len(t, reviews, 1)
++
++	r := reviews[0]
++	assert.Equal(t, "ChZDSUhNMG9nS0VJQ0FnSUNZemVhOFpREAE", r.ReviewID)
++	assert.Equal(t, "Google", r.Source)
++	assert.Equal(t, 5, r.RatingScale)
++	assert.Equal(t, "en", r.Language)
++	assert.Empty(t, r.TranslatedLang)
++	assert.NotEmpty(t, r.TextOriginal)
++	assert.Empty(t, r.TextTranslated)
++	assert.Empty(t, r.ReplyTextOriginal)
++}
+diff --git a/gmaps/testdata/review_aggregator.json b/gmaps/testdata/review_aggregator.json
+new file mode 100644
+index 0000000..fd7c94b
+--- /dev/null
++++ b/gmaps/testdata/review_aggregator.json
+@@ -0,0 +1 @@
++[[["AGG_REVIEW_ID_001", ["0x0:0xaggregator123", null, 1700000000000000, 1700001000000000, [null, null, ["https://www.tripadvisor.com/members/testuser"], null, null, ["Tripadvisor User", "https://example.com/pic.jpg"]], null, null, null, null, null, null, null, null, ["Tripadvisor", "https://www.tripadvisor.com/favicon.ico", null, null, 10]], [null, null, null, null, null, null, null, null, [null, 8.5], null, null, null, null, null, ["de", null], [["Ein tolles Hotel mit gro\u00dfartigem Service."]]]]]]
+\ No newline at end of file
+diff --git a/gmaps/testdata/review_native_no_text.json b/gmaps/testdata/review_native_no_text.json
+new file mode 100644
+index 0000000..a6dbe9f
+--- /dev/null
++++ b/gmaps/testdata/review_native_no_text.json
+@@ -0,0 +1 @@
++[[["Ci9DQUlRQUNvZENodHljRjlvT21jMmJ6UnpkemN6Y0dscE9YRndaUzFuVVhCSVprRRAB", ["0x0:0x4fe4cdec96e220c1", null, 1770906476231835, 1770906476231835, [null, null, ["https://www.google.com/maps/contrib/118210304700470843945/reviews?hl=en"], null, null, ["Lysann Lieblang", "https://lh3.googleusercontent.com/a/ACg8ocL0UCBreTTFDqueEYjlDuIjvhOxqU4-ckHoNwT7qlH59JBsZw=s120-c-rp-mo-br100", ["https://www.google.com/maps/contrib/118210304700470843945?hl=en"], "118210304700470843945", null, 6, 0, null, [0, 3, 1], 12, ["6 reviews", null, null, null, null, [null, "0ahUKEwi2scWu6rmUAxWlG2MBHdkgCVQQ7LoGCDkoAA"]]]], null, "3 months ago", null, null, null, null, null, null, ["Google", "https://www.gstatic.com/images/branding/product/1x/googleg_48dp.png", null, null, 5], null, 1, null, 0], [[5]], [], [null, null, 57, ["https://www.google.com/maps/reviews/data=!4m8!14m7!1m6!2m5!1sCi9DQUlRQUNvZENodHljRjlvT21jMmJ6UnpkemN6Y0dscE9YRndaUzFuVVhCSVprRRAB!2m1!1s0x0:0x4fe4cdec96e220c1!3m1!1s2@1:CAIQACodChtycF9oOmc2bzRzdzczcGlpOXFwZS1nUXBIZkE%7C%7C?hl=en"], ["https://www.google.com/local/content/rap/report?postId=Ci9DQUlRQUNvZENodHljRjlvT21jMmJ6UnpkemN6Y0dscE9YRndaUzFuVVhCSVprRRAB&t=1&entityid=Ci9DQUlRQUNvZENodHljRjlvT21jMmJ6UnpkemN6Y0dscE9YRndaUzFuVVhCSVprRRo-Ci9DQUlRQUNvZENodHljRjlvT21jMmJ6UnpkemN6Y0dscE9YRndaUzFuVVhCSVprRRILMGRZVENnQ29OWnoiEgkAAAAAAAAAABHBIOKW7M3kTyoLMGRZVENnQ29OWno&wv=1&d=286732320", null, null, "0ahUKEwi2scWu6rmUAxWlG2MBHdkgCVQQoykIOigB"], null, [null, [[1, 0]]]], "0ahUKEwi2scWu6rmUAxWlG2MBHdkgCVQQ0pMFCDgoEg"], null, "CAQSQkNpOElBUkluQ2dvQVA3X2JfX19fX19fX0VoRGw4eXpfREVxQnRoV1hHclFBQUFBQUdnZl9BbU90djZFNEdBQWlBQQ==:39"]]
+\ No newline at end of file
+diff --git a/gmaps/testdata/review_native_no_translation.json b/gmaps/testdata/review_native_no_translation.json
+new file mode 100644
+index 0000000..af4157d
+--- /dev/null
++++ b/gmaps/testdata/review_native_no_translation.json
+@@ -0,0 +1 @@
++[[["ChZDSUhNMG9nS0VJQ0FnSUNZemVhOFpREAE", ["0x0:0xa73f342ed9222e57", null, 1555494891197416, 1555494891197416, [null, null, ["https://www.google.com/maps/contrib/110617501430675678911/reviews?hl=en"], null, null, ["Olena Kuzhel", "https://lh3.googleusercontent.com/a-/ALV-UjWPJiLKwP8bGMPunqgUG_49I2iEfBGopbymvRAD4Q8Rg27ARRmW=s120-c-rp-mo-ba3-br100", ["https://www.google.com/maps/contrib/110617501430675678911?hl=en"], "110617501430675678911", null, 46, 31, null, [1, 5, 1], 1, ["Local Guide \u00b7 46 reviews", null, null, null, null, [null, "0ahUKEwj4wK6t6rmUAxULEWMBHV2BLVoQ7LoGCAMoAA"]]]], null, "7 years ago", null, null, null, null, null, null, ["Google", "https://www.gstatic.com/images/branding/product/1x/googleg_48dp.png", null, null, 5], null, 1, null, 0.9195588827133179], [[5], null, null, null, null, null, null, null, null, null, null, null, null, null, ["en"], [["I had been recently in gynecologist Tatjana Mahnhardt and found that she is super nice and highly professional! Her German is perfect, well understandable for foreighners and luckily for me she is also russian-speaking doctor!\nThe only think I did not like that is not nice behavior of ladies on the receiption.", null, [0, 311]]]], [null, null, null, null, null, "https://business.google.com/local/business/4798856530163220559/customers/reviews/reply?p=CiNDaFpEU1VoTk1HOW5TMFZKUTBGblNVTlplbVZoT0ZwUkVBRRAA", [null, null, null, "/local/business/4798856530163220559/customers/reviews/reply?p=CiNDaFpEU1VoTk1HOW5TMFZKUTBGblNVTlplbVZoT0ZwUkVBRRAA"], "https://business.google.com/local/business/4798856530163220559/customers/reviews/deletereply?p=CiNDaFpEU1VoTk1HOW5TMFZKUTBGblNVTlplbVZoT0ZwUkVBRRAA", [null, null, null, "/local/business/4798856530163220559/customers/reviews/deletereply?p=CiNDaFpEU1VoTk1HOW5TMFZKUTBGblNVTlplbVZoT0ZwUkVBRRAA"], null, "https://business.google.com/local/business/4798856530163220559/customers/reviews/reply?p=CiNDaFpEU1VoTk1HOW5TMFZKUTBGblNVTlplbVZoT0ZwUkVBRRAA", [null, null, null, "/local/business/4798856530163220559/customers/reviews/reply?p=CiNDaFpEU1VoTk1HOW5TMFZKUTBGblNVTlplbVZoT0ZwUkVBRRAA"]], [null, null, 4585, ["https://www.google.com/maps/reviews/data=!4m8!14m7!1m6!2m5!1sChZDSUhNMG9nS0VJQ0FnSUNZemVhOFpREAE!2m1!1s0x0:0xa73f342ed9222e57!3m1!1s2@1:CIHM0ogKEICAgICYzea8ZQ%7C%7C?hl=en"], ["https://www.google.com/local/content/rap/report?postId=ChZDSUhNMG9nS0VJQ0FnSUNZemVhOFpREAE&t=1&entityid=ChZDSUhNMG9nS0VJQ0FnSUNZemVhOFpREi0KF0NJSE0wb2dLRUlDQWdJQ1l6ZWE4NVFFEhJDZ3NJNi1fYjVRVVF3S2lSWGcaLAoWQ0lITTBvZ0tFSUNBZ0lDWXplYThGURISQ2dzSTYtX2I1UVVRd0tpUlhnIhIJAAAAAAAAAAARVy4i2S40P6cqCzBSaGpVZkFsNEct&wv=1&d=286732320", null, null, "0ahUKEwj4wK6t6rmUAxULEWMBHV2BLVoQoykIBCgB"], null, [null, [[1, 5]]]], "0ahUKEwj4wK6t6rmUAxULEWMBHV2BLVoQ0pMFCAIoAA"], null, "CAQSRENqRUlBUklwQ2dvQVA3X0xLUGVZX19fX0VoREh6Z2tsUU5zTlpTVTVrQjRBQUFBQUdnbjkzeThDbGRWSGtVSVlBQ0lB:1"]]
+\ No newline at end of file
+diff --git a/gmaps/testdata/review_native_with_reply.json b/gmaps/testdata/review_native_with_reply.json
+new file mode 100644
+index 0000000..ecb5f87
+--- /dev/null
++++ b/gmaps/testdata/review_native_with_reply.json
+@@ -0,0 +1 @@
++[[["Ci9DQUlRQUNvZENodHljRjlvT2xGMmRraFdhSFowWW0xWVNURTBObEptU3pWWVgxRRAB", ["0x0:0xa73f342ed9222e57", null, 1772186522193853, 1772186522193853, [null, null, ["https://www.google.com/maps/contrib/116111130377271376564/reviews?hl=en"], null, null, ["E. \u00d6.", "https://lh3.googleusercontent.com/a/ACg8ocIiIJCE1nOhvrUjWGAU5TEEFEnwFacfUv-iNG1fEglkcSXazA=s120-c-rp-mo-br100", ["https://www.google.com/maps/contrib/116111130377271376564?hl=en"], "116111130377271376564", null, 2, 0, null, [0, 2, 1], 0, ["2 reviews", null, null, null, null, [null, "0ahUKEwj4wK6t6rmUAxULEWMBHV2BLVoQ7LoGCAkoAA"]]]], null, "2 months ago", null, null, null, null, null, null, ["Google", "https://www.gstatic.com/images/branding/product/1x/googleg_48dp.png", null, null, 5], null, 1, null, 0.9994480013847351], [[1], null, null, null, null, null, null, null, null, null, null, null, null, null, ["de", "en", "German", "English", 1], [["Ich bin sehr entt\u00e4uscht vom Verhalten der Rezeption in dieser Praxis.\nIch hatte seit \u00fcber 10 Tagen anhaltende Blutungen und wollte deshalb dringend \u00e4rztlich abgekl\u00e4rt werden. Telefonisch war die Praxis f\u00fcr mich nicht erreichbar, weshalb ich pers\u00f6nlich vorbeigekommen bin. Dabei habe ich ausdr\u00fccklich betont, dass mir bewusst ist, dass viel los sein kann, und dass ich ohne Vorwurf komme.\n\nLeider wurde ich sehr unfreundlich empfangen. Auf meine Schilderung der anhaltenden Blutungen reagierte die Mitarbeiterin \u00fcberfordert und abweisend. Aussagen wie \u201eIch habe ja nur zwei H\u00e4nde\u201c und \u201eWas suchen Sie hier, Sie m\u00fcssen zum Hausarzt\u201c haben mich in dieser Situation sehr getroffen. Ich habe nochmals ruhig erkl\u00e4rt, dass ich seit \u00fcber 10 Tagen Blutungen habe, bekam jedoch lediglich die Antwort, man k\u00f6nne nichts machen.\n\nGerade bei gesundheitlichen Sorgen erwartet man zumindest ein Mindestma\u00df an Empathie und Unterst\u00fctzung. Ich habe mich nicht ernst genommen und sehr allein gelassen gef\u00fchlt.", null, [0, 228]], ["I am very disappointed with the reception staff at this practice.\n\nI had been experiencing continuous bleeding for over 10 days and urgently needed to see a doctor. I couldn't reach the practice by phone, so I went in person. I explicitly stated that I understood they might be busy and that I was there without any resentment.\n\nUnfortunately, I was greeted very rudely. The staff member reacted to my description of the ongoing bleeding in an overwhelmed and dismissive manner. Statements like \"I only have two hands\" and \"What are you doing here? You need to see your family doctor\" deeply offended me in this situation. I calmly explained again that I had been bleeding for over 10 days, but was simply told that nothing could be done.\n\nEspecially when you have health concerns, you expect at least a minimum of empathy and support. I felt disregarded and very alone.", null, [0, 147]]]], [null, 1772266947000000, 1772266947000000, "2 months ago", null, "https://business.google.com/local/business/4798856530163220559/customers/reviews/reply?p=CkRDaTlEUVVsUlFVTnZaRU5vZEhsalJqbHZUMnhHTW1ScmFGZGhTRm93V1cweFdWTlVSVEJPYkVwdFUzcFdXVmd4UlJBQhAA", [null, null, null, "/local/business/4798856530163220559/customers/reviews/reply?p=CkRDaTlEUVVsUlFVTnZaRU5vZEhsalJqbHZUMnhHTW1ScmFGZGhTRm93V1cweFdWTlVSVEJPYkVwdFUzcFdXVmd4UlJBQhAA"], "https://business.google.com/local/business/4798856530163220559/customers/reviews/deletereply?p=CkRDaTlEUVVsUlFVTnZaRU5vZEhsalJqbHZUMnhHTW1ScmFGZGhTRm93V1cweFdWTlVSVEJPYkVwdFUzcFdXVmd4UlJBQhAA", [null, null, null, "/local/business/4798856530163220559/customers/reviews/deletereply?p=CkRDaTlEUVVsUlFVTnZaRU5vZEhsalJqbHZUMnhHTW1ScmFGZGhTRm93V1cweFdWTlVSVEJPYkVwdFUzcFdXVmd4UlJBQhAA"], null, "https://business.google.com/local/business/4798856530163220559/customers/reviews/reply?p=CkRDaTlEUVVsUlFVTnZaRU5vZEhsalJqbHZUMnhHTW1ScmFGZGhTRm93V1cweFdWTlVSVEJPYkVwdFUzcFdXVmd4UlJBQhAA", [null, null, null, "/local/business/4798856530163220559/customers/reviews/reply?p=CkRDaTlEUVVsUlFVTnZaRU5vZEhsalJqbHZUMnhHTW1ScmFGZGhTRm93V1cweFdWTlVSVEJPYkVwdFUzcFdXVmd4UlJBQhAA"], null, ["de", "en", "German", "English", 1], [["Es tut uns sehr leid, dass Sie sich in einer ohnehin belastenden gesundheitlichen Situation nicht gut aufgehoben gef\u00fchlt haben. \n\nUm solche Situationen zu vermeiden, haben wir feste Telefonsprechzeiten eingerichtet, zu denen wir pers\u00f6nlich erreichbar sind. Diese sind auf unserer Website ver\u00f6ffentlicht. Au\u00dferhalb dieser Zeiten f\u00fchrt unser Telefonmen\u00fc Schritt f\u00fcr Schritt durch die Optionen. Bei akuten Beschwerden besteht w\u00e4hrend unserer \u00d6ffnungszeiten jederzeit die M\u00f6glichkeit, eine Nachricht zu hinterlassen \u2013 auf diese R\u00fcckrufbitten reagieren wir in der Regel innerhalb einer Stunde. So k\u00f6nnen wir dringende F\u00e4lle kurzfristig und gezielt in den Praxisablauf integrieren.\n\nUnser Team arbeitet t\u00e4glich daran, einen reibungslosen Ablauf sicherzustellen \u2013 auch in Wochen wie dieser, in denen krankheitsbedingte Ausf\u00e4lle im Team die Belastung zus\u00e4tzlich erh\u00f6hen. Umso bedauerlicher ist es, dass Sie dies als unfreundlich empfunden haben. Wie wir in Zukunft mit solchen Situationen besser umgehen k\u00f6nnen, werden wir intern besprechen.\n\nSollten Sie weiterhin Beschwerden haben, melden Sie sich bitte am Montag Vormittag, wie oben beschrieben.  \n\nIhr Praxisteam", null, [0, 127]], ["We are very sorry that you did not feel well cared for during an already stressful health situation.\n\nTo avoid such situations, we have established fixed telephone consultation hours during which we are personally available. These are published on our website. Outside of these hours, our telephone menu guides you step-by-step through the options. In case of acute symptoms, you can leave a message at any time during our opening hours \u2013 we usually respond to these callback requests within one hour. This allows us to integrate urgent cases into the practice's workflow quickly and efficiently.\n\nOur team works daily to ensure a smooth process \u2013 even in weeks like this one, when staff absences due to illness further increase the workload. It is all the more regrettable that you perceived this as unfriendly. We will discuss internally how we can better handle such situations in the future.\n\nShould you continue to experience symptoms, please contact us on Monday morning as described above.\n\nYour Practice Team", null, [0, 100]]]], [null, null, 3333, ["https://www.google.com/maps/reviews/data=!4m8!14m7!1m6!2m5!1sCi9DQUlRQUNvZENodHljRjlvT2xGMmRraFdhSFowWW0xWVNURTBObEptU3pWWVgxRRAB!2m1!1s0x0:0xa73f342ed9222e57!3m1!1s2@1:CAIQACodChtycF9oOlF2dkhWaHZ0Ym1YSTE0NlJmSzVYX1E%7C%7C?hl=en"], ["https://www.google.com/local/content/rap/report?postId=Ci9DQUlRQUNvZENodHljRjlvT2xGMmRraFdhSFowWW0xWVNURTBObEptU3pWWVgxRRAB&t=1&entityid=Ci9DQUlRQUNvZENodHljRjlvT2xGMmRraFdhSFowWW0xWVNURTBObEptU3pWWVgxRRI-Ci9DQUlRQUNvZENodHljRjlvT2xGMmRraFdhSFowWW0xWVNURTBObEptU3pWWVgxRRILMGRjTGlQQVlVVGYaPgovQ0FJUUFDb2RDaHR5Y0Y5b09sRjJka2hXYUhaMFltMVlTVEUwTmxKbVN6VllYMUUSCzBkY0xpUEFZVVRmIhIJAAAAAAAAAAARVy4i2S40P6cqCzBkY0xpUEFZVVRm&wv=1&d=286732320", null, null, "0ahUKEwj4wK6t6rmUAxULEWMBHV2BLVoQoykICigB"], null, [null, [[1, 0]]]], "0ahUKEwj4wK6t6rmUAxULEWMBHV2BLVoQ0pMFCAgoAg"], null, "CAQSRENqRUlBUklwQ2dvQVA3X2FBSi05X19fX0VoQlN4elhmQTZobkhfOWY1M0lBQUFBQUdnbjkyUHNDWTJGenJhNFlBQ0lB:3"]]
+\ No newline at end of file
 diff --git a/runner/webrunner/webrunner.go b/runner/webrunner/webrunner.go
 index 61484f0..c9784fc 100644
 --- a/runner/webrunner/webrunner.go
